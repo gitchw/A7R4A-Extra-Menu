@@ -61,16 +61,17 @@ esac
 mkdir -p "$OUT"
 CC=arm-linux-gnueabihf-gcc
 COMMON="-march=armv7-a+fp -mfpu=vfpv3-d16 -mfloat-abi=hard -Os -Wall -Wextra -Werror -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
-$CC $COMMON -mthumb -nostdlib -static -no-pie -fno-pie -ffreestanding -fno-builtin -fomit-frame-pointer \
- "-DA6400_UI_MODULE_PATH=\"$MODULE_PATH\"" \
- -Wl,-T,"$ROOT/camera/native_ui_payload.ld",-e,ui_release_loader,--build-id=none \
- "$ROOT/camera/native_ui_load_payload.c" "$ROOT/camera/native_ui_trampoline.S" \
+$CC $COMMON -mthumb -nostdlib -static -fPIC -ffreestanding -fno-builtin -fomit-frame-pointer \
+ "-DA7R4A_UI_MODULE_PATH=\"$MODULE_PATH\"" \
+ -I"$ROOT/camera" \
+ -Wl,-T,"$ROOT/camera/a7r4a_ui_payload.ld",-e,ui_trampoline_entry,--build-id=none \
+ "$ROOT/camera/a7r4a_ui_trampoline.S" "$ROOT/camera/a7r4a_ui_load_payload.c" \
  -o "$OUT/payload.elf"
 arm-linux-gnueabihf-objcopy -O binary -j .text "$OUT/payload.elf" "$OUT/payload.bin"
 for source in native_film_ui_trial3 film_native_view film_menu; do
- $CC $COMMON $DIAGNOSTIC_FLAGS -marm -fPIC -c "$ROOT/camera/$source.c" -o "$OUT/$source.o"
+ $CC $COMMON $DIAGNOSTIC_FLAGS -marm -fPIC -I"$ROOT/camera" -c "$ROOT/camera/$source.c" -o "$OUT/$source.o"
 done
-$CC -mfloat-abi=hard -nostdlib -shared -Wl,--no-undefined \
+$CC -mfloat-abi=hard -nostdlib -shared -Wl,--no-undefined -Wl,-rpath-link,"$LIBS" \
  "$OUT/native_film_ui_trial3.o" "$OUT/film_native_view.o" "$OUT/film_menu.o" \
  -Wl,--no-as-needed "$LIBS/libdl-2.11.2.so" "$LIBS/libc-2.11.2.so" -lgcc \
  -o "$OUT/a6400-film-ui-v3.so"
@@ -88,7 +89,7 @@ assert not re.search(r'\bUND\b.*\b(fopen|fwrite|fread|rename|access|fprintf)\b',
 stop=set(re.findall(r'^\s*\d+:\s+([0-9a-f]+)\s+4\s+OBJECT\s+GLOBAL\s+DEFAULT\s+\d+\s+a6400_ui_stop_requested_v1$',symbols,re.M))
 assert len(stop)==1,stop
 print('OWNED_STOP_RVA 0x'+next(iter(stop))+' uint32: 0=idle, 1=request, 2=stopped-on-UI-thread')
-assert len((p/'payload.bin').read_bytes())<=2296
+assert len((p/'payload.bin').read_bytes())<=1700
 print('TRIAL3 BUILD ONLY: original camera libc versions',sorted(versions),'no UI diagnostic file-I/O imports')
 PY
 sha256sum "$OUT/payload.bin" "$OUT/a6400-film-ui-v3.so"

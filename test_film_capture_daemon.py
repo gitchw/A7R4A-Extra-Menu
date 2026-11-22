@@ -13,8 +13,12 @@ import threading
 import time
 import unittest
 
+from synthetic_native_frames import (
+    SYNTHETIC_FNEXT_UNMOUNTED,
+    SYNTHETIC_INTERLEAVED_FNEXT_METADATA,
+    SYNTHETIC_ROOT_VERSION,
+)
 from test_native_capture_probe import MONITOR as SCANNER_MONITOR, fnv
-from synthetic_native_frames import SYNTHETIC_ROOT_VERSION, SYNTHETIC_FNEXT_UNMOUNTED
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = ROOT / 'camera/film_capture_daemon.c'
@@ -47,7 +51,7 @@ else:
 args=sys.argv[1:]
 if len(args)!=4 or args[0]!='apply':sys.exit(2)
 mode,source,size,target=args
-expected=root/source.removeprefix('A:/')
+expected=root/source.removeprefix('A:/').removeprefix('B:/')
 if not expected.is_file() or expected.stat().st_size!=int(size):sys.exit(3)
 settings=(root/'settings').read_text().strip()
 record=dict(source=source,size=int(size),target=target,settings=settings)
@@ -68,9 +72,11 @@ if fault=='missing_receipt':sys.exit(0)
 if fault=='failed':
  print('RAM_JOB_FAIL stage=off',flush=True);sys.exit(10)
 parts=settings.split()
+verified='0' if fault=='unverified_target' else '1'
 print('RAM_JOB_APPLIED source='+source+' target='+target+' '+' '.join(parts[1:])+
       ' source_bytes='+size+' source_sha256='+'a'*64+
-      ' output_bytes=123 output_sha256='+'b'*64+' original_verified=1',flush=True)
+      ' output_bytes=123 output_sha256='+'b'*64+
+      ' source_access=read_only target_verified='+verified+' original_verified=0',flush=True)
 '''
 
 
@@ -94,6 +100,9 @@ class FilmCaptureDaemonTests(unittest.TestCase):
         self.helper.write_text(JOB)
         self.script = self.base / 'ram-job.sh'
         self.script.write_text(f'#!/bin/sh\nexec python3 "{self.helper}" "$@"\n')
+        self.build_daemon()
+
+    def build_daemon(self, extra_probe=(), extra_build=()):
         (self.base / 'capture_probe_build.h').write_text(
             f'#define CAPTURE_MONITOR "{self.monitor}"\n'
             f'#define CAPTURE_LOCK "{self.base}/capture.lock"\n'
@@ -103,7 +112,8 @@ class FilmCaptureDaemonTests(unittest.TestCase):
             '#define CAPTURE_STARTUP_MS 100u\n#define CAPTURE_COMMAND_MS 1000u\n'
             '#define CAPTURE_PROMPT_QUIET_MS 20u\n'
             '#define CAPTURE_WAIT_MS 10u\n#define CAPTURE_ACTIVE_MS 2200u\n'
-            '#define CAPTURE_INTERVAL_MS 20u\n#define CAPTURE_STABLE_MS 80u\n')
+            '#define CAPTURE_INTERVAL_MS 20u\n#define CAPTURE_STABLE_MS 80u\n'
+            + ''.join(f'{line}\n' for line in extra_probe))
         header = []
         for macro, path in [('SETTINGS', self.settings), ('SCRIPT', self.script)]:
             header += [f'#define FILM_CAPTURE_{macro} "{path}"\n',
@@ -118,6 +128,7 @@ class FilmCaptureDaemonTests(unittest.TestCase):
                    '#define FILM_CAPTURE_BASELINE_TIMEOUT_MS 2000u\n',
                    '#define FILM_CAPTURE_CLI_TIMEOUT_MS 1000u\n',
                    '#define FILM_CAPTURE_JOB_TIMEOUT_MS 2500u\n']
+        header += [f'{line}\n' for line in extra_build]
         (self.base / 'film_capture_daemon_build.h').write_text(''.join(header))
         self.binary = self.base / 'daemon'
         subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
@@ -214,6 +225,152 @@ class FilmCaptureDaemonTests(unittest.TestCase):
         self.assertIn('FILM_CAPTURE_BASELINE count=1', out)
         self.assertFalse((self.base / 'capture.lock').exists())
 
+    def corrupt_metadata(self, mode='once', target='A6400003.JPG'):
+        (self.base/'metadata-reply').write_bytes(SYNTHETIC_INTERLEAVED_FNEXT_METADATA)
+        (self.base/'metadata-fault-target').write_text(target)
+        (self.base/'metadata-fault-mode').write_text(mode)
+
+    def assert_fresh_root_after_corruption(self, out, count=1):
+        commands=(self.base/'scan-commands').read_text().splitlines()
+        faults=[i for i,line in enumerate(commands) if line=='METADATA_FAULT']
+        self.assertEqual(len(faults),count,out)
+        for i in faults[:2]:
+            self.assertEqual(commands[i+1],'MPR FileIf FFirst ms:/DCIM/*',out)
+
+    def test_corrupt_baseline_is_discarded_then_existing_photos_stay_old(self):
+        self.new(3)
+        self.corrupt_metadata()
+        rc,out=self.run_daemon()
+        self.assertEqual(rc,0,out)
+        self.assertIn('FILM_CAPTURE_BASELINE count=2',out)
+        self.assertEqual(self.jobs(),[],out)
+        self.assert_fresh_root_after_corruption(out)
+
+    def test_nul_interleaved_root_frame_is_retried_from_fresh_root(self):
+        rc,out=self.run_daemon(monitor_fault='nul_metadata')
+        self.assertEqual(rc,0,out)
+        self.assertIn('FILM_CAPTURE_BASELINE count=1',out)
+        self.assertIn('FILM_CAPTURE_SCAN_RETRY stage=baseline',out)
+        self.assertIn('FILM_CAPTURE_SCAN_RESUMED stage=baseline',out)
+        self.assertEqual(self.jobs(),[],out)
+
+    def test_persistent_nul_interleaving_stops_after_three_fresh_roots(self):
+        (self.base/'nul-metadata-always').write_text('1')
+        rc,out=self.run_daemon(monitor_fault='nul_metadata')
+        self.assertEqual(rc,21,out)
+        self.assertNotIn('FILM_CAPTURE_BASELINE count=',out)
+        self.assertEqual(out.count('FILM_CAPTURE_SCAN_RETRY stage=baseline'),2,out)
+        self.assertIn('FILM_CAPTURE_SCAN_EXHAUSTED stage=baseline',out)
+        self.assertIn('uncertain=1\n',(self.base/'manifest').read_text())
+        self.assertEqual(self.jobs(),[],out)
+
+    def test_corrupt_watch_discards_partial_snapshot_and_dispatches_new_photo_once(self):
+        self.new(3)
+        def interrupt(_):
+            self.corrupt_metadata()
+            self.new(2)
+        rc,out=self.run_daemon(events=[(.04,interrupt)])
+        self.assertEqual(rc,0,out)
+        self.assertEqual([job['source'] for job in self.jobs()],
+                         ['A:/DCIM/10061115/A6400002.JPG'],out)
+        self.assertNotIn('A6409682.JPG',str(self.jobs()))
+        self.assert_fresh_root_after_corruption(out)
+
+    def test_persistent_corruption_stops_after_three_inventories_without_dispatch(self):
+        self.new(3)
+        def interrupt(_):
+            self.corrupt_metadata('always')
+            self.new(2)
+        rc,out=self.run_daemon(events=[(.04,interrupt)])
+        self.assertEqual(rc,21,out)
+        self.assertEqual((self.base/'metadata-fault-count').read_text(),'3',out)
+        self.assertEqual(self.jobs(),[],out)
+        self.assertTrue((self.base/'capture.lock').exists())
+        self.assertIn('uncertain=1\n',(self.base/'manifest').read_text())
+        self.assert_fresh_root_after_corruption(out,3)
+        self.assertTrue((self.base/'scan-commands').read_text().endswith('METADATA_FAULT\n'))
+
+    def test_corrupt_baseline_retry_limit_never_publishes_partial_baseline(self):
+        self.new(3)
+        self.corrupt_metadata('always')
+        rc,out=self.run_daemon()
+        self.assertEqual(rc,21,out)
+        self.assertEqual((self.base/'metadata-fault-count').read_text(),'3',out)
+        self.assertNotIn('FILM_CAPTURE_BASELINE count=',out)
+        self.assertEqual(self.jobs(),[],out)
+
+    def assert_fatal_after_corruption(self, fault, reason):
+        self.new(3)
+        self.corrupt_metadata()
+        (self.base/'metadata-next-fault').write_text(fault)
+        rc,out=self.run_daemon()
+        self.assertEqual(rc,21,out)
+        self.assertEqual((self.base/'metadata-fault-count').read_text(),'1',out)
+        self.assertIn('CAPTURE_DIAG reason='+reason+' ',out)
+        self.assertEqual(self.jobs(),[],out)
+        self.assertEqual(len((self.base/'scan-commands').read_text().splitlines()),6,out)
+
+    def test_native_error_after_corruption_stops_without_retrying_error(self):
+        self.assert_fatal_after_corruption('native_error','native_status')
+
+    def test_overflow_after_corruption_stops_without_retrying_transport(self):
+        self.assert_fatal_after_corruption('overflow','ring_overflow')
+
+    def test_unknown_callback_after_corruption_stops_without_retrying_callback(self):
+        self.assert_fatal_after_corruption('unknown_callback','invalid_callback')
+
+    def test_timeout_after_corruption_stops_without_retrying_incomplete_command(self):
+        self.assert_fatal_after_corruption('no_prompt','command_timeout')
+
+    def test_successful_baseline_resets_limit_for_later_watch_corruption(self):
+        self.new(3)
+        self.corrupt_metadata()
+        rc,out=self.run_daemon(events=[(.04,lambda _:
+            (self.base/'metadata-fault-mode').write_text('always'))])
+        self.assertEqual(rc,21,out)
+        self.assertIn('FILM_CAPTURE_BASELINE count=2',out)
+        self.assertEqual((self.base/'metadata-fault-count').read_text(),'4',out)
+        self.assertEqual(self.jobs(),[],out)
+
+    def test_recovery_does_not_reprocess_an_already_applied_photo(self):
+        self.new(3)
+        def interrupt():
+            self.corrupt_metadata()
+            self.new(4)
+        rc,out=self.run_daemon(events=[(.04,lambda _:self.new()),
+            (.04,self.after_record('runtime.log','FILM_CAPTURE_JOB_DONE result=0 ',interrupt))])
+        self.assertEqual(rc,0,out)
+        self.assertEqual([job['source'] for job in self.jobs()],
+                         ['A:/DCIM/10061115/A6400002.JPG','A:/DCIM/10061115/A6400004.JPG'],out)
+        self.assert_fresh_root_after_corruption(out)
+
+    def test_corruption_resets_candidate_stability_before_any_dispatch(self):
+        self.new(3)
+        def interrupt():
+            self.corrupt_metadata()
+            (self.base/'metadata-fault-delay').write_text('.15')
+        seen='state=waiting source=A:/DCIM/10061115/A6400002.JPG'
+        rc,out=self.run_daemon(events=[(.04,lambda _:self.new()),
+            (.04,self.after_record('manifest',seen,interrupt))])
+        self.assertEqual(rc,0,out)
+        self.assertEqual(len(self.jobs()),1,out)
+        lines=out.splitlines()
+        recovered=next(line for line in lines if line.startswith('FILM_CAPTURE_SCAN_RESUMED '))
+        pending=next(line for line in lines if line.startswith('FILM_CAPTURE_DISPATCH '))
+        at=lambda line:int(line.split('uptime_ms=')[1].split()[0])
+        self.assertGreaterEqual(at(pending)-at(recovered),80,out)
+
+    def test_stop_during_corruption_retry_starts_no_more_native_command(self):
+        self.new(3)
+        self.corrupt_metadata()
+        rc,out=self.run_daemon(ready_events=[(.01,self.after_record(
+            'runtime.log','FILM_CAPTURE_SCAN_RETRY ',
+            lambda:(self.base/'stop').write_text('stop')))])
+        self.assertEqual(rc,0,out)
+        self.assertIn('reason=stop_file',out)
+        self.assertEqual(self.jobs(),[],out)
+        self.assertTrue((self.base/'scan-commands').read_text().endswith('METADATA_FAULT\n'),out)
+
     def test_on_dispatches_live_preset_after_monitor_is_reaped(self):
         rc, out = self.run_daemon(events=[(.04, lambda _: self.new())])
         self.assertEqual(rc, 0, out)
@@ -221,7 +378,7 @@ class FilmCaptureDaemonTests(unittest.TestCase):
         job = self.jobs()[0]
         self.assertEqual(job['source'], 'A:/DCIM/10061115/A6400002.JPG')
         self.assertEqual(job['settings'], ON.strip())
-        self.assertRegex(job['target'], r'^A:/A6400/TEST/F\d{7}\.JPG$')
+        self.assertRegex(job['target'], r'^A:/A7R4A/TEST/F\d{7}\.JPG$')
         self.assertFalse((self.base / 'inflight').exists())
         self.assertFalse((self.base / 'job.lock').exists())
         self.assertIn('FILM_CAPTURE_JOB_DONE', out)
@@ -229,6 +386,22 @@ class FilmCaptureDaemonTests(unittest.TestCase):
     def test_cold_root_version_record_still_dispatches_new_photo_once(self):
         (self.base/'recorded-version').write_bytes(SYNTHETIC_ROOT_VERSION)
         rc,out=self.run_daemon(monitor_fault='wd_version_recorded',
+                               events=[(.04,lambda _:self.new())])
+        self.assertEqual(rc,0,out)
+        self.assertEqual(len(self.jobs()),1,out)
+        self.assertEqual(self.jobs()[0]['source'],'A:/DCIM/10061115/A6400002.JPG')
+        self.assertIn('FILM_CAPTURE_JOB_DONE result=0 ',out)
+
+    def test_getstill_callback_still_dispatches_new_photo_exactly_once(self):
+        rc,out=self.run_daemon(monitor_fault='getstill_live',
+                               events=[(.04,lambda _:self.new())])
+        self.assertEqual(rc,0,out)
+        self.assertEqual(len(self.jobs()),1,out)
+        self.assertEqual(self.jobs()[0]['source'],'A:/DCIM/10061115/A6400002.JPG')
+        self.assertIn('FILM_CAPTURE_JOB_DONE result=0 ',out)
+
+    def test_cache_playback_notice_still_dispatches_new_photo_exactly_once(self):
+        rc,out=self.run_daemon(monitor_fault='cache_playback_live',
                                events=[(.04,lambda _:self.new())])
         self.assertEqual(rc,0,out)
         self.assertEqual(len(self.jobs()),1,out)
@@ -432,6 +605,9 @@ class FilmCaptureDaemonTests(unittest.TestCase):
     def test_zero_exit_without_applied_receipt_is_not_accepted(self):
         self.assert_job_stops_dispatch('missing_receipt')
 
+    def test_zero_exit_with_unverified_saved_target_is_not_accepted(self):
+        self.assert_job_stops_dispatch('unverified_target')
+
     def test_stop_during_job_waits_for_completed_job(self):
         def stop_when_running(_):
             deadline = time.monotonic() + 2
@@ -509,12 +685,12 @@ class FilmCaptureDaemonTests(unittest.TestCase):
         self.assertEqual(self.jobs(), [])
         self.assertFalse((self.base / 'capture.lock').exists())
 
-    def synthetic_midscan_unmounted(self, location):
+    def recorded_midscan_unmounted(self, location):
         (self.base/'recorded-unmounted').write_bytes(SYNTHETIC_FNEXT_UNMOUNTED)
         (self.base/'midscan-unmounted').write_text(location)
 
     def test_partial_baseline_waits_then_excludes_existing_photos(self):
-        self.synthetic_midscan_unmounted('sub_next')
+        self.recorded_midscan_unmounted('sub_next')
         def restore(_):
             manifest=(self.base/'manifest').read_text()
             self.assertIn('phase=baseline_media_wait\n',manifest)
@@ -550,6 +726,213 @@ class FilmCaptureDaemonTests(unittest.TestCase):
             self.assertEqual(commands[i+1],'MPR FileIf FFirst ms:/DCIM/*')
         self.assertEqual(out.count('FILM_CAPTURE_DISPATCH '),1,out)
         self.assertFalse((self.base/'capture.lock').exists())
+
+    def test_latest_dir_only_skips_older_dcf_directories_and_rolls_over(self):
+        newer_dir = self.base / 'DCIM/10161116'
+        newer_dir.mkdir()
+        (newer_dir / 'A6400002.JPG').write_bytes(b'baseline newer')
+        self.build_daemon(
+            extra_probe=('#undef CAPTURE_WAIT_MS', '#define CAPTURE_WAIT_MS 0u'),
+            extra_build=('#define FILM_CAPTURE_LATEST_DIR_ONLY 1',),
+        )
+        roll_dir = self.base / 'DCIM/10261117'
+        def add_in_current(_):
+            (newer_dir / 'A6400003.JPG').write_bytes(b'new current shot')
+        def rollover_folder():
+            roll_dir.mkdir(exist_ok=True)
+            (roll_dir / 'A6400004.JPG').write_bytes(b'new rollover shot')
+        rc, out = self.run_daemon(
+            events=[
+                (.03, add_in_current),
+                (.05, self.after_record('manifest', 'state=applied source=A:/DCIM/10161116/A6400003.JPG ', rollover_folder)),
+            ])
+        self.assertEqual(rc, 0, out)
+        self.assertIn('FILM_CAPTURE_BASELINE count=1', out)
+        self.assertIn('FILM_CAPTURE_FAST latest=1 ', out)
+        commands = (self.base / 'scan-commands').read_text()
+        self.assertIn('MPR FileIf FFirst ms:/DCIM/10161116/*', commands)
+        self.assertNotIn('MPR FileIf FFirst ms:/DCIM/10061115/*', commands)
+        self.assertEqual([job['source'] for job in self.jobs()],
+                         ['A:/DCIM/10161116/A6400003.JPG', 'A:/DCIM/10261117/A6400004.JPG'], out)
+        manifest = (self.base / 'manifest').read_text()
+        self.assertNotIn('A:/DCIM/10161116/A6400002.JPG', manifest)
+        self.assertIn('state=applied source=A:/DCIM/10161116/A6400003.JPG', manifest)
+
+    def test_latest_dir_only_handles_more_than_max_dirs_folders(self):
+        for n in range(101, 113):
+            d = self.base / f'DCIM/{n}60515'
+            d.mkdir()
+            (d / 'A6400001.JPG').write_bytes(b'old photo')
+        latest_dir = self.base / 'DCIM/11260515'
+        self.build_daemon(
+            extra_probe=('#undef CAPTURE_WAIT_MS', '#define CAPTURE_WAIT_MS 0u'),
+            extra_build=('#define FILM_CAPTURE_LATEST_DIR_ONLY 1',),
+        )
+        rc, out = self.run_daemon(events=[(.03, lambda _: (latest_dir / 'A6400002.JPG').write_bytes(b'new shot'))])
+        self.assertEqual(rc, 0, out)
+        self.assertIn('FILM_CAPTURE_BASELINE count=1', out)
+        self.assertEqual([job['source'] for job in self.jobs()], ['A:/DCIM/11260515/A6400002.JPG'], out)
+
+    def test_latest_dir_only_handles_more_than_max_files_in_folder(self):
+        for n in range(2, 141):
+            (self.dcim / f'A640{n:04d}.JPG').write_bytes(b'old photo')
+        self.build_daemon(
+            extra_probe=('#undef CAPTURE_WAIT_MS', '#define CAPTURE_WAIT_MS 0u'),
+            extra_build=('#define FILM_CAPTURE_LATEST_DIR_ONLY 1',),
+        )
+        rc, out = self.run_daemon(events=[(.05, lambda _: (self.dcim / 'A6400141.JPG').write_bytes(b'new shot'))])
+        self.assertEqual(rc, 0, out)
+        self.assertIn('FILM_CAPTURE_BASELINE count=128', out)
+        self.assertEqual([job['source'] for job in self.jobs()], ['A:/DCIM/10061115/A6400141.JPG'], out)
+
+    def test_proc_sd_trigger_wakes_before_heartbeat_when_io_settles(self):
+        proc_dir = self.base / 'fakeproc'
+        proc_dir.mkdir()
+        irqs = proc_dir / 'interrupts'
+        irqs.write_text('218:   10  0  0  0  GIC  mmc0\n227:  100  0  0  0  GIC  emmc0\n')
+        self.build_daemon(
+            extra_probe=('#undef CAPTURE_STABLE_MS', '#define CAPTURE_STABLE_MS 40u'),
+            extra_build=(
+                '#define FILM_CAPTURE_PROC_TRIGGER 1',
+                '#define FILM_CAPTURE_IDLE_HEARTBEAT_MS 4500u',
+                '#define FILM_CAPTURE_PROC_TICK_MS 20u',
+                '#define FILM_CAPTURE_PROC_QUIET_TICKS 2u',
+                f'#define FILM_CAPTURE_PROC_INTERRUPTS "{irqs}"',
+            ),
+        )
+        def emmc_noise(_):
+            irqs.write_text('218:   10  0  0  0  GIC  mmc0\n227:  900  0  0  0  GIC  emmc0\n')
+        def burst_write(_):
+            self.new()
+            irqs.write_text('218:   50  0  0  0  GIC  mmc0\n227: 1500  0  0  0  GIC  emmc0\n')
+        rc, out = self.run_daemon(events=[(.02, emmc_noise), (.06, burst_write)])
+        self.assertEqual(rc, 0, out)
+        self.assertIn('FILM_CAPTURE_FAST latest=0 proc=1 ', out)
+        self.assertEqual([job['source'] for job in self.jobs()], ['A:/DCIM/10061115/A6400002.JPG'], out)
+
+    def test_proc_mmc_pci_trigger_wakes_before_heartbeat_and_ignores_emmc(self):
+        proc_dir = self.base / 'fakeproc_pci'
+        proc_dir.mkdir()
+        irqs = proc_dir / 'interrupts'
+        irqs.write_text('206:   0  0  0  0  GIC  ms\n227:  100  0  0  0  GIC  emmc0\n240:  1000  0  0  0  GIC  mmc-pci\n')
+        self.build_daemon(
+            extra_probe=('#undef CAPTURE_STABLE_MS', '#define CAPTURE_STABLE_MS 40u'),
+            extra_build=(
+                '#define FILM_CAPTURE_PROC_TRIGGER 1',
+                '#define FILM_CAPTURE_IDLE_HEARTBEAT_MS 4500u',
+                '#define FILM_CAPTURE_PROC_TICK_MS 20u',
+                '#define FILM_CAPTURE_PROC_QUIET_TICKS 2u',
+                f'#define FILM_CAPTURE_PROC_INTERRUPTS "{irqs}"',
+            ),
+        )
+        def emmc_noise(_):
+            irqs.write_text('206:   0  0  0  0  GIC  ms\n227:  900  0  0  0  GIC  emmc0\n240:  1000  0  0  0  GIC  mmc-pci\n')
+        def pci_burst_write(_):
+            self.new()
+            irqs.write_text('206:   0  0  0  0  GIC  ms\n227: 1500  0  0  0  GIC  emmc0\n240:  1600  0  0  0  GIC  mmc-pci\n')
+        rc, out = self.run_daemon(events=[(.02, emmc_noise), (.06, pci_burst_write)])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([job['source'] for job in self.jobs()], ['A:/DCIM/10061115/A6400002.JPG'], out)
+
+    def test_slot_b_source_dispatches_to_b_target(self):
+        slotb_mon = self.base / 'monitor-slotb'
+        slotb_mon.write_text(MONITOR.replace("args[3][4:]", "args[3][len('/SlotB:'):]").replace("ms:/DCIM", "/SlotB:/DCIM"))
+        slotb_mon.chmod(0o700)
+        slotb_dir = self.base / 'slotb_build'
+        slotb_dir.mkdir()
+        (slotb_dir / 'capture_probe_build.h').write_text(
+            f'#define CAPTURE_MONITOR "{slotb_mon}"\n'
+            f'#define CAPTURE_LOCK "{self.base}/slotb-capture.lock"\n'
+            f'#define CAPTURE_STOP_FILE "{self.base}/stop"\n'
+            f'#define CAPTURE_MONITOR_BYTES {slotb_mon.stat().st_size}u\n'
+            f'#define CAPTURE_MONITOR_FNV 0x{fnv(slotb_mon.read_bytes()):08x}u\n'
+            '#define CAPTURE_MPR_ROOT "/SlotB:/DCIM"\n'
+            '#define CAPTURE_STARTUP_MS 100u\n#define CAPTURE_COMMAND_MS 1000u\n'
+            '#define CAPTURE_PROMPT_QUIET_MS 20u\n'
+            '#define CAPTURE_WAIT_MS 10u\n#define CAPTURE_ACTIVE_MS 2200u\n'
+            '#define CAPTURE_INTERVAL_MS 20u\n#define CAPTURE_STABLE_MS 80u\n')
+        (slotb_dir / 'film_capture_daemon_build.h').write_text(
+            (self.base / 'film_capture_daemon_build.h').read_text())
+        slotb_bin = self.base / 'daemon-slotb'
+        subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(slotb_dir), '-I', str(ROOT / 'camera'),
+                        str(SOURCE), str(ROOT / 'camera/film_runtime_log.c'),
+                        '-o', str(slotb_bin)], check=True, capture_output=True)
+        self.binary = slotb_bin
+        rc, out = self.run_daemon(events=[(.04, lambda _: self.new())])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.jobs()), 1, out)
+        job = self.jobs()[0]
+        self.assertEqual(job['source'], 'B:/DCIM/10061115/A6400002.JPG')
+        self.assertRegex(job['target'], r'^B:/A7R4A/TEST/F\d{7}\.JPG$')
+
+    def test_persistent_daemon_recovers_from_root_playback_and_transient_corruption(self):
+        self.build_daemon(
+            extra_probe=('#undef CAPTURE_WAIT_MS', '#define CAPTURE_WAIT_MS 0u'),
+            extra_build=('#undef FILM_CAPTURE_PERSISTENT', '#define FILM_CAPTURE_PERSISTENT 1',
+                         '#define FILM_CAPTURE_LATEST_DIR_ONLY 1'),
+        )
+        rc, out = self.run_daemon(
+            events=[
+                (.03, lambda _: self.corrupt_metadata('always')),
+                (.22, lambda _: ((self.base / 'corrupt-metadata').unlink() if (self.base / 'corrupt-metadata').exists() else None, self.new())),
+                (.85, lambda _: (self.base / 'stop').write_text('stop')),
+            ],
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([job['source'] for job in self.jobs()], ['A:/DCIM/10061115/A6400002.JPG'], out)
+
+    def test_persistent_daemon_recovers_from_baseline_overflow(self):
+        self.build_daemon(
+            extra_probe=('#undef CAPTURE_WAIT_MS', '#define CAPTURE_WAIT_MS 0u'),
+            extra_build=('#undef FILM_CAPTURE_PERSISTENT', '#define FILM_CAPTURE_PERSISTENT 1',
+                         '#define FILM_CAPTURE_LATEST_DIR_ONLY 1'),
+        )
+        self.new(3)
+        self.corrupt_metadata()
+        (self.base / 'metadata-next-fault').write_text('overflow')
+        rc, out = self.run_daemon(
+            ready_events=[
+                (.35, lambda _: (self.base / 'metadata-next-fault').unlink() if (self.base / 'metadata-next-fault').exists() else None),
+            ],
+            events=[
+                (.05, lambda _: self.new(4)),
+                (.35, lambda _: (self.base / 'stop').write_text('stop')),
+            ],
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertIn('FILM_CAPTURE_BASELINE_TRANSPORT_RETRY retry=1', out)
+        self.assertIn('FILM_CAPTURE_BASELINE count=2', out)
+        self.assertEqual([job['source'] for job in self.jobs()], ['A:/DCIM/10061115/A6400004.JPG'], out)
+
+    def test_v39_media_unavailable_releases_monitor_and_recovers(self):
+        self.build_daemon(
+            extra_probe=('#undef CAPTURE_WAIT_MS', '#define CAPTURE_WAIT_MS 0u'),
+            extra_build=('#undef FILM_CAPTURE_PERSISTENT', '#define FILM_CAPTURE_PERSISTENT 1',
+                         '#define FILM_CAPTURE_LATEST_DIR_ONLY 1',
+                         '#define FILM_CAPTURE_MEDIA_UNAVAILABLE_PAUSE_MS 80u'),
+        )
+        observed = {}
+
+        def check_monitor_stopped():
+            pid = int((self.base / 'monitor.pid').read_text())
+            try:
+                os.kill(pid, 0)
+                observed['alive'] = True
+            except ProcessLookupError:
+                observed['alive'] = False
+
+        rc, out = self.run_daemon(
+            events=[
+                (.03, lambda _: (self.base / 'media-unmounted').write_text('1')),
+                (.18, lambda _: check_monitor_stopped()),
+                (.20, lambda _: ((self.base / 'media-unmounted').unlink(), self.new(5))),
+                (.85, lambda _: (self.base / 'stop').write_text('stop')),
+            ],
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(observed.get('alive', True), 'mpr_monio monitor stayed alive during media_unavailable')
+        self.assertEqual([job['source'] for job in self.jobs()], ['A:/DCIM/10061115/A6400005.JPG'], out)
 
 
 if __name__ == '__main__':

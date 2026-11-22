@@ -6,6 +6,7 @@ verify copied bytes and JPEG integrity before dispatch or accepting an SD write.
 import os
 from pathlib import Path
 import signal
+import struct
 import subprocess
 import tempfile
 import time
@@ -55,6 +56,9 @@ for request in sys.stdin:
  if fault.startswith('read_unavailable'):
   source=command.split()[2]
   if fault=='read_unavailable_wrong':source=source.replace('A6409686','A6409999')
+  if fault=='read_unavailable_mwf_benign':
+   print('[MWF]  [RsrcAcsr] Not acquired!',flush=True)
+   print('[GetStillTargetMaxFileSize]target[44744704] max[58202112]',flush=True)
   print("[IFSYS]Can't open file "+source,flush=True)
   if fault=='read_unavailable_partial':(root/'input.jpg').write_bytes(b'partial')
   if fault=='read_unavailable_extra':print('unexpected extra diagnostic',flush=True)
@@ -64,6 +68,12 @@ for request in sys.stdin:
   expected="[IFSYS]Can't open file "+command.split()[2]
   if fault=='absent_wrong_target':expected=expected.replace('F1234567','F7654321')
   if fault=='absent_suffix':expected+=' EXTRA'
+  if fault=='absent_mwf_benign':
+   print('[MWF]  [RsrcAcsr] Not acquired!',flush=True)
+   print('[MWF]  [RsrcAcsr] already Acquired!',flush=True)
+   print('[GetStillTargetMaxFileSize]target[44744704] max[58202112]',flush=True)
+  if fault=='absent_mwf_error':
+   print('[MWF] ERROR unexpected failure',flush=True)
   if fault=='absent_incomplete':
    print(expected+'MWF>',flush=True);continue
   print(expected,flush=True)
@@ -78,6 +88,28 @@ for request in sys.stdin:
  if fault=='dies':sys.exit(0)
  if fault in ('overflow','pre_echo_then_fresh_overflow'):
   print('MON RING OVERFLOW\nMWF>',flush=True);continue
+ if fault=='overflow_between_echoes':
+  print('[IF_DB] NotLoad\n###OVERFLOW###\n'+command+'\r\nMWF>',flush=True);continue
+ if fault=='reanchor_mwf_pre_exec_error':
+  print('[SynthMgr] background async status line',flush=True)
+  print('[SynthCnt][0x1000][ERROR] AsyncBackgroundNotice : [00000001]',flush=True)
+  print('[SynthFsys][0x1000][ERROR] QueuedStatus : [00000002]',flush=True)
+  print('[MWF] background diagnostic before execution',flush=True)
+  sys.stdout.write(command+'\r\nMWF>');sys.stdout.flush();continue
+ if fault=='reanchor_absent':
+  print('[SynthFsys][0x1000][ERROR] QueuedStatus : [00000002]',flush=True)
+  sys.stdout.write(command+'\r\n[IFSYS]Can\'t open file '+command.split()[2]+'\r\nMWF>');sys.stdout.flush();continue
+ if fault=='reanchor_prefixed_chunked':
+  print('[SynthFsys][0x1000][ERROR] QueuedStatus : [00000002]',flush=True)
+  sys.stdout.write('MWF>'+command[:9]);sys.stdout.flush();time.sleep(.04)
+  sys.stdout.write(command[9:]+'\r\nMWF>');sys.stdout.flush();continue
+ if fault=='post_reanchor_error':
+  sys.stdout.write(command+'\r\nnative ERROR 0x123\r\nMWF>');sys.stdout.flush();continue
+ if fault=='reanchor_triple_echo_over_cap':
+  print('x'*30000,flush=True)
+  print(command,flush=True)
+  print('x'*34000,flush=True)
+  print(command+'\r\nMWF>',flush=True);continue
  if fault=='capacity':print('x'*33000,flush=True);continue
  if fault=='open_error':print("Can't open file "+command.split()[-1]+'\nMWF>',flush=True);continue
  if fault=='native_error':print('native ERROR 0x123\nMWF>',flush=True);continue
@@ -425,6 +457,205 @@ class FilmNativeCommandTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.communicate()
+
+    def test_dual_slot_b_drive_and_a7r4a_target_paths(self):
+        for op, path in (
+            ('read', 'B:/DCIM/10061115/A7R40001.JPG'),
+            ('absent', 'B:/A7R4A/TEST/F1234567.JPG'),
+            ('write', 'B:/A7R4A/TEST/F1234567.JPG'),
+            ('flush', 'B:/A7R4A/TEST/F1234567.JPG'),
+            ('readback', 'B:/A7R4A/TEST/F1234567.JPG'),
+        ):
+            with self.subTest(op=op, path=path):
+                if op in ('read', 'readback', 'absent'):
+                    (self.base / 'input.jpg').unlink(missing_ok=True)
+                result = self.run_native(op, path, fault='delayed_copy' if op in ('read', 'readback') else 'absent_ok' if op == 'absent' else '')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for bad_op, bad_path in (
+            ('read', 'C:/DCIM/10061115/A7R40001.JPG'),
+            ('write', 'B:/OTHER/TEST/F1234567.JPG'),
+        ):
+            result = self.run_native(bad_op, bad_path)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('uncertain=0', result.stdout)
+
+    def _build_fake_libinfrafsys(self, include_mmca=True, include_mmcb=False):
+        buf = bytearray(0x80000)
+        base = 0x10000
+        get_letter_prefix = bytes([
+            0x39, 0x49, 0x2d, 0xe9, 0xf0, 0x41, 0x05, 0x46,
+            0x79, 0x44, 0x01, 0x20, 0x00, 0xaf, 0x37, 0x4c,
+        ])
+        buf[base + 0x18c8c:base + 0x18c8c + 16] = get_letter_prefix
+        table_ptr = 0x7c000
+        status_ptr = 0x7c200
+        drv_a = 0x7d000
+        drv_b = 0x7e000
+        drv_c = 0x7f000
+        struct.pack_into('<I', buf, base + 0x6e648, table_ptr)
+        struct.pack_into('<I', buf, base + 0x6e694, status_ptr)
+        struct.pack_into('<H', buf, status_ptr, 1)
+        struct.pack_into('<I', buf, table_ptr + 0 * 4, drv_a)
+        struct.pack_into('<I', buf, table_ptr + (26 + 16) * 4, drv_a)
+        buf[drv_a + 0xb] = ord('A')
+        buf[drv_a + 0xe1c:drv_a + 0xe1c + 15] = b'/dev/nflasha23\0'
+        if include_mmca:
+            struct.pack_into('<I', buf, table_ptr + 1 * 4, drv_b)
+            struct.pack_into('<I', buf, table_ptr + (26 + 19) * 4, drv_b)
+            buf[drv_b + 0xb] = ord('B')
+            buf[drv_b + 0xe1c:drv_b + 0xe1c + 10] = b'/dev/mmca\0'
+        if include_mmcb:
+            struct.pack_into('<I', buf, table_ptr + 2 * 4, drv_c)
+            struct.pack_into('<I', buf, table_ptr + (26 + 20) * 4, drv_c)
+            buf[drv_c + 0xb] = ord('C')
+            buf[drv_c + 0xe1c:drv_c + 0xe1c + 10] = b'/dev/mmcb\0'
+        return buf
+
+    def test_cold_boot_mmca_on_drive_b_rewrites_read_absent_write_flush_readback(self):
+        comm = self.base / 'comm'
+        maps = self.base / 'maps'
+        mem = self.base / 'mem'
+        comm.write_text('im.elf\n')
+        maps.write_text('00010000-00080000 r-xp 00000000 b3:01 123 /usr/lib/libInfraFsys.so\n')
+        mem.write_bytes(self._build_fake_libinfrafsys(include_mmca=True))
+        self.header.write_text(
+            self.header.read_text()
+            + f'#define FILM_NATIVE_PROC_COMM "{comm}"\n'
+            + f'#define FILM_NATIVE_PROC_MAPS "{maps}"\n'
+            + f'#define FILM_NATIVE_PROC_MEM "{mem}"\n'
+        )
+        subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(self.base), str(SOURCE), '-o', str(self.binary)],
+                       check=True, capture_output=True)
+        b_capture = 'B' + CAPTURE[1:]
+        b_target = 'B' + TARGET[1:]
+        r = self.run_native('read', CAPTURE)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual((self.base / 'command').read_text(),
+                         f'IFSYS cp {b_capture} {self.base}/input.jpg')
+        r = self.run_native('read', CAPTURE, fault='read_unavailable')
+        self.assertEqual(r.returncode, 14, r.stdout)
+        self.assertIn('reason=source_unavailable', r.stdout)
+        r = self.run_native('absent', TARGET, fault='absent_ok')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('NATIVE_ABSENT', r.stdout)
+        self.assertEqual((self.base / 'command').read_text(),
+                         f'IFSYS cp {b_target} {self.base}/input.jpg')
+        r = self.run_native('write', TARGET)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual((self.base / 'command').read_text(),
+                         f'IFSYS cp {self.base}/output.jpg {b_target}')
+        r = self.run_native('flush', TARGET)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual((self.base / 'command').read_text(), f'IFSYS flush {b_target}')
+        r = self.run_native('readback', TARGET)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual((self.base / 'command').read_text(),
+                         f'IFSYS cp {b_target} {self.base}/input.jpg')
+        comm.write_text('other\n')
+        r = self.run_native('read', CAPTURE)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual((self.base / 'command').read_text(),
+                         f'IFSYS cp {CAPTURE} {self.base}/input.jpg')
+
+    def test_dynamic_im_pid_proc_root_and_slot_b_mmcb_drive_lookup(self):
+        proc_root = self.base / 'proc'
+        (proc_root / '162').mkdir(parents=True)
+        (proc_root / '999').mkdir(parents=True)
+        (proc_root / '999' / 'comm').write_text('other\n')
+        (proc_root / '162' / 'comm').write_text('im.elf\n')
+        (proc_root / '162' / 'maps').write_text(
+            '00010000-00080000 r-xp 00000000 b3:01 123 /usr/lib/libInfraFsys.so\n'
+        )
+        (proc_root / '162' / 'mem').write_bytes(
+            self._build_fake_libinfrafsys(include_mmca=False, include_mmcb=True)
+        )
+        self.header.write_text(
+            self.header.read_text()
+            + f'#define FILM_NATIVE_PROC_ROOT "{proc_root}"\n'
+        )
+        subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(self.base), str(SOURCE), '-o', str(self.binary)],
+                       check=True, capture_output=True)
+        r = self.run_native('read', 'B:/DCIM/10061115/A7R40001.JPG')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual((self.base / 'command').read_text(),
+                         f'IFSYS cp C:/DCIM/10061115/A7R40001.JPG {self.base}/input.jpg')
+        (self.base / 'monitor.pid').unlink()
+        r_a = self.run_native('read', CAPTURE)
+        self.assertEqual(r_a.returncode, 14, r_a.stdout)
+        self.assertIn('reason=source_unavailable', r_a.stdout)
+        self.assertFalse((self.base / 'monitor.pid').exists())
+
+    def test_unmounted_mmca_in_im_never_falls_back_to_drive_a_or_runs_monitor(self):
+        comm = self.base / 'comm'
+        maps = self.base / 'maps'
+        mem = self.base / 'mem'
+        comm.write_text('im.elf\n')
+        maps.write_text('00010000-00080000 r-xp 00000000 b3:01 123 /usr/lib/libInfraFsys.so\n')
+        mem.write_bytes(self._build_fake_libinfrafsys(include_mmca=False))
+        self.header.write_text(
+            self.header.read_text()
+            + f'#define FILM_NATIVE_PROC_COMM "{comm}"\n'
+            + f'#define FILM_NATIVE_PROC_MAPS "{maps}"\n'
+            + f'#define FILM_NATIVE_PROC_MEM "{mem}"\n'
+        )
+        subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(self.base), str(SOURCE), '-o', str(self.binary)],
+                       check=True, capture_output=True)
+        r = self.run_native('read', CAPTURE)
+        self.assertEqual(r.returncode, 14, r.stdout)
+        self.assertIn('reason=source_unavailable', r.stdout)
+        self.assertIn('uncertain=0', r.stdout)
+        self.assertNotIn('NATIVE_SENT', r.stdout)
+        self.assertFalse((self.base / 'monitor.pid').exists())
+        for op in ('absent', 'write', 'flush', 'readback'):
+            r = self.run_native(op, TARGET)
+            self.assertEqual(r.returncode, 6, r.stdout)
+            self.assertIn('reason=before_send', r.stdout)
+            self.assertIn('uncertain=0', r.stdout)
+            self.assertNotIn('NATIVE_ABSENT', r.stdout)
+            self.assertNotIn('NATIVE_SENT', r.stdout)
+            self.assertFalse((self.base / 'monitor.pid').exists())
+
+    def test_second_mwf_echo_reanchors_past_pre_exec_async_errors(self):
+        result = self.run_native('read', CAPTURE, fault='reanchor_mwf_pre_exec_error')
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('NATIVE_RETURN operation=read reason=fresh_prompt response_bytes=4 uncertain=0',
+                      result.stdout)
+        result_abs = self.run_native('absent', TARGET, fault='reanchor_absent')
+        self.assertEqual(result_abs.returncode, 0, result_abs.stdout)
+        self.assertIn('NATIVE_ABSENT operation=absent reason=source_open_failed',
+                      result_abs.stdout)
+        result_chunk = self.run_native('read', CAPTURE, fault='reanchor_prefixed_chunked')
+        self.assertEqual(result_chunk.returncode, 0, result_chunk.stdout)
+        self.assertIn('NATIVE_RETURN operation=read reason=fresh_prompt response_bytes=4',
+                      result_chunk.stdout)
+
+    def test_post_reanchor_error_and_between_echo_overflow_still_fail_closed(self):
+        err = self.run_native('read', CAPTURE, fault='post_reanchor_error')
+        self.assertEqual(err.returncode, 1, err.stdout)
+        self.assertIn('reason=native_error', err.stdout)
+        self.assertIn('uncertain=0', err.stdout)
+        ov = self.run_native('read', CAPTURE, fault='overflow_between_echoes')
+        self.assertEqual(ov.returncode, 21, ov.stdout)
+        self.assertIn('reason=ring_overflow', ov.stdout)
+        self.assertIn('uncertain=1', ov.stdout)
+        triple = self.run_native('read', CAPTURE, fault='reanchor_triple_echo_over_cap')
+        self.assertEqual(triple.returncode, 21, triple.stdout)
+        self.assertIn('reason=response_capacity', triple.stdout)
+        self.assertIn('uncertain=1', triple.stdout)
+
+    def test_benign_sony_mwf_traces_do_not_break_absent_or_source_unavailable(self):
+        abs_ok = self.run_native('absent', TARGET, fault='absent_mwf_benign')
+        self.assertEqual(abs_ok.returncode, 0, abs_ok.stdout)
+        self.assertIn('NATIVE_ABSENT operation=absent reason=source_open_failed', abs_ok.stdout)
+        abs_err = self.run_native('absent', TARGET, fault='absent_mwf_error')
+        self.assertEqual(abs_err.returncode, 1, abs_err.stdout)
+        self.assertIn('reason=absence_unproven', abs_err.stdout)
+        read_ok = self.run_native('read', CAPTURE, fault='read_unavailable_mwf_benign')
+        self.assertEqual(read_ok.returncode, 14, read_ok.stdout)
+        self.assertIn('reason=source_unavailable', read_ok.stdout)
 
 
 if __name__ == '__main__':

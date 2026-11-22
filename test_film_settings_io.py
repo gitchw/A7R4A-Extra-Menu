@@ -34,7 +34,7 @@ class FilmSettingsIoTests(unittest.TestCase):
 
     def test_invalid_settings_leave_the_existing_config_untouched(self):
         self.path.write_text('prior complete config')
-        self.assertNotEqual(self.write(Settings(1,5,2,1)),0)
+        self.assertNotEqual(self.write(Settings(1,12,2,1)),0)
         self.assertEqual(self.path.read_text(),'prior complete config')
         self.assertFalse(self.path.with_suffix('.ini.new').exists())
 

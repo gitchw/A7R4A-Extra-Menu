@@ -4,7 +4,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT=${1:?output directory}
 LIBS=${2:?original camera libc directory}
-MONITOR=${3:-$ROOT/host-tests/author-film-install-20261114/camera-mwf_monio.elf}
+MONITOR=${3:-$LIBS/camera-mwf_monio.elf}
 BOOT_STAGE=${FILM_NATIVE_BOOT_STAGE:-0}
 mkdir -p "$OUT"
 python3 - "$MONITOR" "$OUT" "$BOOT_STAGE" <<'PY'
@@ -13,7 +13,7 @@ import hashlib,sys
 monitor,out=map(Path,sys.argv[1:3])
 stage=sys.argv[3]
 assert stage in ('0','1'),'FILM_NATIVE_BOOT_STAGE must be 0 or 1'
-expected='f2ab9ba60dd0b3d327e64b10b8e6c5451d59e6026a1b6702578852088cfd2a84'
+expected='f2b25289d7d490f56993269cbf4891aa1db91451a67d0e8984c60aa67c25f1ef'
 if not monitor.is_file():
     raise SystemExit('Pinned camera-mwf_monio.elf missing; supply exact original monitor locally')
 data=monitor.read_bytes()
@@ -31,10 +31,10 @@ input_path='/tmp_bt/a6400-film-boot.copy' if stage=='1' else '/tmp_bt/a6400-film
 print('PINNED_MONITOR',monitor,expected)
 PY
 CC=arm-linux-gnueabihf-gcc
-COMMON="-march=armv7-a+fp -mfpu=vfpv3-d16 -mfloat-abi=hard -marm -Os -Wall -Wextra -Werror -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+COMMON="-march=armv7-a+fp -mfpu=vfpv3-d16 -mfloat-abi=hard -marm -Os -Wall -Wextra -Werror -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DFILM_NATIVE_STARTUP_MS=600u -DFILM_NATIVE_QUIET_MS=120u -DFILM_NATIVE_STARTUP_MAX_MS=4000u"
 $CC $COMMON -std=c11 -fPIE -I"$OUT" -c "$ROOT/camera/film_native_command.c" -o "$OUT/native-command.o"
 $CC $COMMON -c "$ROOT/camera/film_settings_start.S" -o "$OUT/start.o"
-$CC -mfloat-abi=hard -nostdlib -pie -Wl,-e,_start,-z,now,--dynamic-linker=/lib/ld-linux.so.3 \
+$CC -mfloat-abi=hard -nostdlib -pie -Wl,-e,_start,-z,now,--dynamic-linker=/lib/ld-linux.so.3,-rpath-link,"$LIBS" \
  "$OUT/start.o" "$OUT/native-command.o" -Wl,--no-as-needed "$LIBS/libc-2.11.2.so" -lgcc \
  -o "$OUT/a6400-film-native-command.elf"
 arm-linux-gnueabihf-readelf -lWdVs "$OUT/a6400-film-native-command.elf" > "$OUT/elf-compatibility.txt"

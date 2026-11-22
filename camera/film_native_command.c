@@ -5,6 +5,7 @@
  */
 #define _GNU_SOURCE
 #include "film_native_command_build.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -19,16 +20,19 @@
 #include <unistd.h>
 
 #ifndef FILM_NATIVE_STARTUP_MS
-#define FILM_NATIVE_STARTUP_MS 1000u
+#define FILM_NATIVE_STARTUP_MS 150u
 #endif
 #ifndef FILM_NATIVE_COMMAND_MS
 #define FILM_NATIVE_COMMAND_MS 60000u
 #endif
 #ifndef FILM_NATIVE_QUIET_MS
-#define FILM_NATIVE_QUIET_MS 200u
+#define FILM_NATIVE_QUIET_MS 40u
 #endif
 #ifndef FILM_NATIVE_STARTUP_MAX_MS
 #define FILM_NATIVE_STARTUP_MAX_MS 3000u
+#endif
+#ifndef FILM_NATIVE_PROC_ROOT
+#define FILM_NATIVE_PROC_ROOT "/proc"
 #endif
 #define RESPONSE_BYTES 32768u
 #define HISTORY_BYTES 131072u
@@ -59,11 +63,13 @@ static int safe_name(const char *p,unsigned count) {
     return 1;
 }
 static int capture_path(const char *p) {
-    return strlen(p)==29 && !memcmp(p,"A:/DCIM/",8) && p[16]=='/' &&
-        safe_name(p+8,8) && safe_name(p+17,8) && !strcmp(p+25,".JPG");
+    return strlen(p)==29 && (p[0]=='A'||p[0]=='B') && !memcmp(p+1,":/DCIM/",7) &&
+        p[16]=='/' && safe_name(p+8,8) && safe_name(p+17,8) && !strcmp(p+25,".JPG");
 }
 static int output_path(const char *p) {
-    if(strlen(p)!=26 || memcmp(p,"A:/A6400/TEST/F",15) || strcmp(p+22,".JPG"))return 0;
+    if(strlen(p)!=26 || (p[0]!='A'&&p[0]!='B') ||
+       (memcmp(p+1,":/A7R4A/TEST/F",14) && memcmp(p+1,":/A6400/TEST/F",14)) ||
+       strcmp(p+22,".JPG"))return 0;
     for(unsigned i=15;i<22;++i)if(p[i]<'0'||p[i]>'9')return 0;
     return 1;
 }
@@ -163,6 +169,25 @@ static int input_absent(void) {
     if(fd>=0){close(fd);return 0;}
     return errno==ENOENT;
 }
+static int has_token(const char *s,unsigned size,const char *tok) {
+    size_t tlen=strlen(tok);
+    if(size<tlen)return 0;
+    for(unsigned i=0;i<=size-tlen;++i)if(!memcmp(s+i,tok,tlen))return 1;
+    return 0;
+}
+/* Sony A7R4A mwf_monio interleaves benign non-error traces (e.g. RsrcAcsr and
+ * GetStillTargetMaxFileSize) during IFSYS commands while camera state shifts. */
+static int benign_mwf_line(const char *line,unsigned size) {
+    if(has_token(line,size,"ERROR") || has_token(line,size,"Error") ||
+       has_token(line,size,"error") || has_token(line,size,"FAIL") ||
+       has_token(line,size,"Fail") || has_token(line,size,"fail") ||
+       has_token(line,size," err") || has_token(line,size,"[err") ||
+       has_token(line,size,"Can't open") || has_token(line,size,"OVERFLOW"))
+        return 0;
+    if(size>=6u && !memcmp(line,"[MWF] ",6))return 1;
+    if(size>=27u && !memcmp(line,"[GetStillTargetMaxFileSize]",27))return 1;
+    return 0;
+}
 /* An absent result records only this command's source-open failure. It is not
  * proof of ENOENT, atomic exclusive creation, or a reservation of the SD path.
  * Fail closed on any additional diagnostic instead of ignoring another error. */
@@ -176,7 +201,8 @@ static int absent_reply(const char *path,const char *command) {
         unsigned size=(unsigned)(end-line);
         if(next && size==(unsigned)n && !memcmp(line,expected,size))++count;
         else if(size && !(size==4u && !memcmp(line,"MWF>",4)) &&
-                !(next && echo_line(line,size,command)))return 0;
+                !(next && echo_line(line,size,command)) &&
+                !(next && benign_mwf_line(line,size)))return 0;
         if(!next)break;
         line=next+1;
     }
@@ -195,10 +221,31 @@ static int report(int result,int uncertain,const char *reason,const char *operat
     }
     return result;
 }
+static int update_overflow(unsigned *match,unsigned char c) {
+    static const char token[]="OVERFLOW";
+    if(c==(unsigned char)token[*match])++*match;
+    else *match=c=='O'?1u:0u;
+    if(*match==sizeof(token)-1u){*match=0;return 1;}
+    return 0;
+}
+/* Real Sony mwf_monio writes our command once (`\n`) when queueing it and Sony's
+ * MWF task prints it again (`\r\n`) when starting execution; if the first echo
+ * arrived on chunk boundaries or matched before queued MWF async logs flushed,
+ * re-anchor once on the second exact echo before any closing prompt. */
+static int pending_prompt_echo(const char *buf,unsigned used,const char *command,int echoed) {
+    if(echoed!=1)return 0;
+    const char *mwf=strstr(buf,"MWF>");
+    if(!mwf || (mwf!=buf && mwf[-1]!='\n') || strchr(mwf,'\n'))return 0;
+    const char *tail=mwf+4;
+    while(tail<buf+used && (*tail==' '||*tail=='\t'))++tail;
+    size_t len=(size_t)((buf+used)-tail),cmd_len=strlen(command);
+    return len>0u && len<=cmd_len && !memcmp(tail,command,len);
+}
 static int exchange(struct transport *t,const char *command,const char *operation,int flushing,const char *absence_path,const char *read_source) {
     uint32_t start,now;unsigned used=0,received=0;size_t sent=0;
     char line[ECHO_LINE_BYTES];unsigned line_used=0,overflow_match=0;
-    int echoed=0,long_line=0;
+    unsigned resp_line_start=0,resp_overflow_match=0;
+    int echoed=0,long_line=0,resp_long_line=0,resp_overflowed=0;
     char request[512];int n=snprintf(request,sizeof(request),"%s\n",command);
     if(n<1 || (unsigned)n>=sizeof(request) || clock_ms(&start))
         return report(6,0,"before_send",operation,0);
@@ -226,12 +273,7 @@ static int exchange(struct transport *t,const char *command,const char *operatio
                      * into a failure of a command whose echo has not appeared. */
                     if(++pre_echo_received>HISTORY_BYTES-startup_received)
                         return report(21,1,"history_capacity",operation,used);
-                    static const char token[]="OVERFLOW";
-                    if(c==(unsigned char)token[overflow_match])++overflow_match;
-                    else overflow_match=c=='O'?1u:0u;
-                    if(overflow_match==sizeof(token)-1u) {
-                        ++pre_echo_overflows;overflow_match=0;
-                    }
+                    if(update_overflow(&overflow_match,c))++pre_echo_overflows;
                     if(c=='\r')continue;
                     if(c=='\n') {
                         if(!long_line && echo_line(line,line_used,command))echoed=1;
@@ -240,13 +282,37 @@ static int exchange(struct transport *t,const char *command,const char *operatio
                     else long_line=1;
                     continue;
                 }
+                if(update_overflow(&resp_overflow_match,c))resp_overflowed=1;
                 if(++received>RESPONSE_BYTES)
                     return report(21,1,"response_capacity",operation,used);
-                if(c!='\r')response[used++]=(char)c;
+                if(c=='\r')continue;
+                if(c=='\n') {
+                    if(echoed==1 && !resp_overflowed && !resp_long_line) {
+                        char saved=response[resp_line_start];
+                        response[resp_line_start]=0;
+                        int prior_prompt=strstr(response,"MWF>")!=NULL;
+                        response[resp_line_start]=saved;
+                        if(!prior_prompt &&
+                           echo_line(response+resp_line_start,used-resp_line_start,command)) {
+                            if(received>HISTORY_BYTES-startup_received-pre_echo_received)
+                                return report(21,1,"history_capacity",operation,used);
+                            pre_echo_received+=received;
+                            used=0;received=0;response[0]=0;
+                            resp_line_start=0;resp_long_line=0;echoed=2;
+                            continue;
+                        }
+                    }
+                    response[used++]=(char)c;
+                    resp_line_start=used;resp_long_line=0;
+                    continue;
+                }
+                if(used-resp_line_start>=ECHO_LINE_BYTES)resp_long_line=1;
+                response[used++]=(char)c;
             }
             response[used]=0;
-            if(strstr(response,"OVERFLOW"))return report(21,1,"ring_overflow",operation,used);
-            if(echoed && strstr(response,"MWF>")) {
+            if(resp_overflowed || strstr(response,"OVERFLOW"))
+                return report(21,1,"ring_overflow",operation,used);
+            if(echoed && !pending_prompt_echo(response,used,command,echoed) && strstr(response,"MWF>")) {
                 if(absence_path) {
                     if(!input_absent())return report(1,0,"input_not_absent",operation,used);
                     if(!absent_reply(absence_path,command))
@@ -271,6 +337,116 @@ static int exchange(struct transport *t,const char *command,const char *operatio
     }
 }
 
+static int read_mem32(int fd,uint32_t addr,void *buf,size_t len) {
+    return addr>=0x10000u && addr<=0x7fffffffu-len &&
+        lseek(fd,(off_t)addr,SEEK_SET)==(off_t)addr &&
+        read(fd,buf,len)==(ssize_t)len?0:-1;
+}
+static int match_slot_dev(const char *buf,const char *dev9) {
+    return !memcmp(buf,dev9,9u) &&
+        (!buf[9] || (buf[9]>='a' && buf[9]<='z' && !buf[10]));
+}
+static int open_im_proc_paths(char *maps_path,size_t maps_cap,char *mem_path,size_t mem_cap,int *found_im) {
+    *found_im=0;
+#ifdef FILM_NATIVE_PROC_COMM
+    char comm[16];
+    int fd=open(FILM_NATIVE_PROC_COMM,O_RDONLY);
+    if(fd<0)return 0;
+    ssize_t n=read(fd,comm,sizeof(comm));
+    close(fd);
+    if(n!=7 || memcmp(comm,"im.elf\n",7))return 0;
+    *found_im=1;
+    return snprintf(maps_path,maps_cap,"%s",FILM_NATIVE_PROC_MAPS)>0 &&
+        strlen(FILM_NATIVE_PROC_MAPS)<maps_cap &&
+        snprintf(mem_path,mem_cap,"%s",FILM_NATIVE_PROC_MEM)>0 &&
+        strlen(FILM_NATIVE_PROC_MEM)<mem_cap ? 0 : -1;
+#else
+    DIR *dir=opendir(FILM_NATIVE_PROC_ROOT);
+    if(!dir)return 0;
+    struct dirent *entry;long found=-1;unsigned matches=0;
+    while((entry=readdir(dir))) {
+        char *end=NULL;long pid=strtol(entry->d_name,&end,10);
+        if(!*entry->d_name || *end || pid<=0)continue;
+        char cpath[128],comm[16];
+        int cn=snprintf(cpath,sizeof(cpath),"%s/%ld/comm",FILM_NATIVE_PROC_ROOT,pid);
+        if(cn<1 || (unsigned)cn>=sizeof(cpath))continue;
+        int fd=open(cpath,O_RDONLY);
+        if(fd<0)continue;
+        ssize_t n=read(fd,comm,sizeof(comm));
+        close(fd);
+        if(n==7 && !memcmp(comm,"im.elf\n",7)){found=pid;++matches;}
+    }
+    closedir(dir);
+    if(!matches)return 0;
+    *found_im=1;
+    if(matches!=1u || found<=0)return -1;
+    int m1=snprintf(maps_path,maps_cap,"%s/%ld/maps",FILM_NATIVE_PROC_ROOT,found);
+    int m2=snprintf(mem_path,mem_cap,"%s/%ld/mem",FILM_NATIVE_PROC_ROOT,found);
+    return (m1>0 && (unsigned)m1<maps_cap && m2>0 && (unsigned)m2<mem_cap)?0:-1;
+#endif
+}
+/* Resolve runtime A:/B: drive letter from im.elf libInfraFsys.so (ILCE-7RM4A 1.12).
+ * Verified offsets: Fsys_GetDriveLetter=0x18c8c, g_fsys GOT=0x6e648,
+ * g_fsysStatus GOT=0x6e694, drv+0xb=letter, drv+0xe1c=dev path,
+ * drives[45]=/dev/mmca (dev_id 19+26), drives[46]=/dev/mmcb (dev_id 20+26). */
+static char slot_drive_letter(char slot) {
+    static const unsigned char fsys_get_letter_prefix[16]={
+        0x39,0x49,0x2d,0xe9,0xf0,0x41,0x05,0x46,
+        0x79,0x44,0x01,0x20,0x00,0xaf,0x37,0x4c
+    };
+    const char *dev9=slot=='B'?"/dev/mmcb":"/dev/mmca";
+    const unsigned fast_slot=slot=='B'?46u:45u;
+    char maps_path[160],mem_path[160];int found_im=0;
+    if(open_im_proc_paths(maps_path,sizeof(maps_path),mem_path,sizeof(mem_path),&found_im))
+        return 0;
+    if(!found_im)return slot;
+    int fd=open(maps_path,O_RDONLY);
+    if(fd<0)return 0;
+    char line[256];ssize_t n;uint32_t base=0;unsigned pos=0;
+    while(!base && (n=read(fd,response,RESPONSE_BYTES))>0) {
+        for(ssize_t i=0;i<n;++i) {
+            char c=response[i];
+            if(c=='\n') {
+                line[pos]=0;
+                if(pos>=56u && line[8]=='-' && !memcmp(line+18,"r-xp 00000000",13) &&
+                   strstr(line,"/usr/lib/libInfraFsys.so")) {
+                    uint32_t v=0;unsigned k;
+                    for(k=0;k<8u;++k) {
+                        char h=line[k];
+                        unsigned d=h>='0'&&h<='9'?(unsigned)(h-'0'):
+                                   h>='a'&&h<='f'?(unsigned)(h-'a'+10):16u;
+                        if(d>=16u)break;
+                        v=(v<<4)|d;
+                    }
+                    if(k==8u){base=v;break;}
+                }
+                pos=0;
+            } else if(pos+1u<sizeof(line))line[pos++]=c;
+        }
+    }
+    close(fd);
+    if(!base)return 0;
+    fd=open(mem_path,O_RDONLY);
+    if(fd<0)return 0;
+    uint32_t tp=0,sp=0,drives[52];uint16_t st=0;char letter=0;
+    if(!read_mem32(fd,base+0x18c8cu,line,16) && !memcmp(line,fsys_get_letter_prefix,16) &&
+       !read_mem32(fd,base+0x6e648u,&tp,4) && !read_mem32(fd,base+0x6e694u,&sp,4) &&
+       !read_mem32(fd,sp,&st,2) && (st&1u) && !read_mem32(fd,tp,drives,sizeof(drives))) {
+        uint32_t drv=drives[fast_slot];unsigned char dl=0;
+        if(drv && !read_mem32(fd,drv+0xbu,&dl,1) && dl>='A' && dl<='Z' &&
+           drives[dl-'A']==drv && !read_mem32(fd,drv+0xe1cu,line,11) &&
+           match_slot_dev(line,dev9))letter=(char)dl;
+        else {
+            for(unsigned i=0;i<26u;++i) {
+                if(drives[i] && !read_mem32(fd,drives[i]+0xe1cu,line,11) &&
+                   match_slot_dev(line,dev9)){letter=(char)('A'+i);break;}
+            }
+        }
+    }
+    close(fd);
+    return letter;
+}
+
 int main(int argc,char **argv) {
     setvbuf(stdout,NULL,_IONBF,0);
 #ifdef FILM_NATIVE_BOOT_STAGE_PATH
@@ -279,31 +455,43 @@ int main(int argc,char **argv) {
      * Photo-runtime builds do not expose this operation. */
     (void)argv;
     if(argc!=1)return report(2,0,"arguments","none",0);
-    const char *operation="stage",*path=FILM_NATIVE_BOOT_STAGE_PATH;
+    const char *operation="stage",*raw_path=FILM_NATIVE_BOOT_STAGE_PATH;
 #else
     if(argc!=3)return report(2,0,"arguments","none",0);
-    const char *operation=argv[1],*path=argv[2];
+    const char *operation=argv[1],*raw_path=argv[2];
 #endif
-    char command[512];int flushing=0,n=-1;
+    int is_stage=0,is_read=0,is_write=0,is_flush=0,is_absent=0,is_readback=0;
 #ifdef FILM_NATIVE_BOOT_STAGE_PATH
-    if(!input_absent())return report(1,0,"input_not_absent",operation,0);
-    if(!strcmp(operation,"stage"))
-        n=snprintf(command,sizeof(command),"IFSYS cp %s %s",path,FILM_NATIVE_INPUT);
-    else
+    is_stage=!strcmp(operation,"stage");
 #endif
-    if(!strcmp(operation,"read") && capture_path(path))
-        n=snprintf(command,sizeof(command),"IFSYS cp %s %s",path,FILM_NATIVE_INPUT);
-    else if((!strcmp(operation,"readback") || !strcmp(operation,"absent")) && output_path(path))
-        n=snprintf(command,sizeof(command),"IFSYS cp %s %s",path,FILM_NATIVE_INPUT);
-    else if(!strcmp(operation,"write") && output_path(path))
-        n=snprintf(command,sizeof(command),"IFSYS cp %s %s",FILM_NATIVE_OUTPUT,path);
-    else if(!strcmp(operation,"flush") && output_path(path)) {
-        n=snprintf(command,sizeof(command),"IFSYS flush %s",path);flushing=1;
-    }
-    if(n<1 || (unsigned)n>=sizeof(command))return report(2,0,"operation_or_path","none",0);
-    const char *absence_path=!strcmp(operation,"absent")?path:NULL;
-    if(absence_path && !input_absent())return report(1,0,"input_not_absent",operation,0);
+    is_read=!strcmp(operation,"read") && capture_path(raw_path);
+    is_readback=!strcmp(operation,"readback") && output_path(raw_path);
+    is_absent=!strcmp(operation,"absent") && output_path(raw_path);
+    is_write=!strcmp(operation,"write") && output_path(raw_path);
+    is_flush=!strcmp(operation,"flush") && output_path(raw_path);
+    if(!(is_stage || is_read || is_readback || is_absent || is_write || is_flush))
+        return report(2,0,"operation_or_path","none",0);
+    if((is_stage || is_absent) && !input_absent())
+        return report(1,0,"input_not_absent",operation,0);
     if(!monitor_matches())return report(3,0,"monitor_pin",operation,0);
+    char drv=slot_drive_letter(raw_path[0]);
+    if(!drv) {
+        if(is_stage || (is_read && input_absent()))
+            return report(14,0,"source_unavailable",operation,0);
+        return report(6,0,"before_send",operation,0);
+    }
+    char path_buf[64],command[512];
+    if(snprintf(path_buf,sizeof(path_buf),"%s",raw_path)<2 ||
+       strlen(raw_path)>=sizeof(path_buf))
+        return report(2,0,"operation_or_path","none",0);
+    path_buf[0]=drv;
+    const char *path=path_buf;
+    int flushing=is_flush,n=-1;
+    if(is_write)n=snprintf(command,sizeof(command),"IFSYS cp %s %s",FILM_NATIVE_OUTPUT,path);
+    else if(is_flush)n=snprintf(command,sizeof(command),"IFSYS flush %s",path);
+    else n=snprintf(command,sizeof(command),"IFSYS cp %s %s",path,FILM_NATIVE_INPUT);
+    if(n<1 || (unsigned)n>=sizeof(command))return report(2,0,"operation_or_path","none",0);
+    const char *absence_path=is_absent?path:NULL;
     signal(SIGHUP,SIG_IGN);signal(SIGPIPE,SIG_IGN);
     signal(SIGTERM,stop_signal);signal(SIGINT,stop_signal);
     struct transport t={-1,-1,-1};

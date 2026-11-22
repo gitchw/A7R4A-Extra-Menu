@@ -9,11 +9,11 @@ import sys
 TEMPLATES=Path(__file__).with_name('film-runtime-v2-templates')
 DESTS={
  'ui':'a6400-film-ui-v3-persist.so','menu_job':'a6400-film-menu-job.elf',
- 'worker':'a6400-film-job.elf','native':'a6400-film-native-command.elf',
+ 'worker':'a7r4a-film-job.elf','native':'a6400-film-native-command.elf',
  'ram_job':'a6400-film-ram-job.sh','capture_daemon':'a6400-film-capture-daemon.elf',
- 'guard':'a6400-ui-load-guard.elf','check':'a6400-check-persist.req',
- 'install':'a6400-install-persist.req','remove':'a6400-remove-persist.req'}
-OPTIONAL={'ui_stop':'a6400-film-ui-stop.elf'}
+ 'guard':'a7r4a-ui-load-guard.elf','check':'a7r4a-check.req',
+ 'install':'a7r4a-install.req','remove':'a7r4a-remove.req'}
+OPTIONAL={'ui_stop':'a6400-film-ui-stop.elf','probe':'a7r4a-ui-probe.so'}
 
 def digest(data):return hashlib.sha256(data).hexdigest()
 def fnv(data):
@@ -62,6 +62,10 @@ def load_artifacts(spec,base):
  require(capture_pins.get('daemon_sha256')==artifacts['capture_daemon']['sha256'] and
          capture_pins.get('daemon_bytes')==len(artifacts['capture_daemon']['data']),
          'capture build receipt ELF missing or mismatched')
+ ram_text=artifacts['ram_job']['data'].decode('utf-8')
+ for var,role in [('NATIVE_SHA','native'),('WORKER_SHA','worker'),('SETTINGS_SHA','menu_job')]:
+  found=re.findall(rf'^{var}=([0-9a-f]{{64}})$',ram_text,re.M)
+  if found:require(found==[artifacts[role]['sha256']],'RAM job '+var+' mismatch')
  return artifacts,pins,capture_pins
 
 def render(name,replacements):

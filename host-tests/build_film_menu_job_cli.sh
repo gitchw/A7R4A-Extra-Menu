@@ -27,7 +27,7 @@ rva=int(matches[0][0],16)
 h=2166136261
 for b in data:h=((h^b)*16777619)&0xffffffff
 (out/'film_menu_job_build.h').write_text(
- '#define FILM_JOB_PROC "/proc/149"\n'
+ '#define FILM_JOB_PROC "/proc/auto"\n'
  f'#define FILM_JOB_MODULE {json.dumps(module)}\n'
  f'#define FILM_JOB_MODULE_BYTES {len(data)}u\n'
  f'#define FILM_JOB_MODULE_FNV 0x{h:08x}u\n'
@@ -49,12 +49,12 @@ for source in film_menu_job_cli film_settings_source film_settings_snapshot film
  if [ "$source" = film_settings_snapshot ]; then
   SNAPSHOT_FLAGS="-DFILM_SETTINGS_PERSISTENT=$PERSISTENT"
  fi
- $CC $COMMON $SNAPSHOT_FLAGS -std=c11 -fPIE -I"$OUT" -c "$ROOT/camera/$source.c" -o "$OUT/$source.o"
+ $CC $COMMON $SNAPSHOT_FLAGS -DA7R4A_DYNAMIC_IDENTITY=1 -std=c11 -fPIE -I"$OUT" -I"$ROOT/camera" -c "$ROOT/camera/$source.c" -o "$OUT/$source.o"
  OBJECTS="$OBJECTS $OUT/$source.o"
 done
 $CC $COMMON -c "$ROOT/camera/film_settings_start.S" -o "$OUT/start.o"
 $CC -mfloat-abi=hard -nostdlib -pie \
- -Wl,-e,_start,-z,now,--dynamic-linker=/lib/ld-linux.so.3 \
+ -Wl,-e,_start,-z,now,--dynamic-linker=/lib/ld-linux.so.3,-rpath-link,"$LIBS" \
  "$OUT/start.o" $OBJECTS -Wl,--no-as-needed "$LIBS/libc-2.11.2.so" -lgcc \
  -o "$OUT/a6400-film-menu-job.elf"
 arm-linux-gnueabihf-readelf -lWdVs "$OUT/a6400-film-menu-job.elf" > "$OUT/elf-compatibility.txt"

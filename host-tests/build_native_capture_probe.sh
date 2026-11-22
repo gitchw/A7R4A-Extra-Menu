@@ -4,12 +4,13 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT=${1:?output directory}
 LIBS=${2:?original camera libc directory}
+MONITOR=${3:-$LIBS/camera-mpr_monio.elf}
 mkdir -p "$OUT"
-python3 - "$ROOT/host-tests/camera-mpr_monio.elf" "$OUT" <<'PY'
+python3 - "$MONITOR" "$OUT" <<'PY'
 from pathlib import Path
 import hashlib,sys
 p,out=map(Path,sys.argv[1:]);d=p.read_bytes();h=2166136261
-assert hashlib.sha256(d).hexdigest()=='300ed9c5a90dc26c3390b5fdd85c5a6e4d5f26e24c6022aa56832f83a47a96bf'
+assert hashlib.sha256(d).hexdigest()=='0d6e63cfb9ba9db035e7a1113eb2179037a41ef9226293771253298738743817'
 for b in d:h=((h^b)*16777619)&0xffffffff
 (out/'capture_probe_build.h').write_text(
  '#define CAPTURE_MONITOR "/usr/bin/mpr_monio.elf"\n'
@@ -22,7 +23,7 @@ CC=arm-linux-gnueabihf-gcc
 COMMON="-march=armv7-a+fp -mfpu=vfpv3-d16 -mfloat-abi=hard -marm -Os -Wall -Wextra -Werror -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
 $CC $COMMON -std=c11 -fPIE -I"$OUT" -c "$ROOT/camera/native_capture_probe.c" -o "$OUT/probe.o"
 $CC $COMMON -c "$ROOT/camera/film_settings_start.S" -o "$OUT/start.o"
-$CC -mfloat-abi=hard -nostdlib -pie -Wl,-e,_start,-z,now,--dynamic-linker=/lib/ld-linux.so.3 \
+$CC -mfloat-abi=hard -nostdlib -pie -Wl,-e,_start,-z,now,--dynamic-linker=/lib/ld-linux.so.3,-rpath-link,"$LIBS" \
  "$OUT/start.o" "$OUT/probe.o" -Wl,--no-as-needed "$LIBS/libc-2.11.2.so" -lgcc \
  -o "$OUT/a6400-capture-probe-v4.elf"
 arm-linux-gnueabihf-readelf -lWdVs "$OUT/a6400-capture-probe-v4.elf" > "$OUT/elf-compatibility.txt"

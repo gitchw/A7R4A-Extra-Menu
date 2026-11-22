@@ -1,75 +1,83 @@
-# A6400 Extra-Menu
+# A7R4A Extra-Menu (`ILCE-7RM4A Ver. 1.12`)
 
-![A6400 機身顯示自製觸控選單，包含 LUT 開關、Film 選擇與 Close](docs/images/a6400-extra-menu-camera.jpg)
+面向 **Sony α7R IV A（`ILCE-7RM4A` 固件 `Ver. 1.12`）** 的机内触控胶片菜单、后台自动套色/颗粒/光晕渲染与**脱机冷启动持久化**移植项目，基于 [PCIEARIA/A6400-Extra-Menu](https://github.com/PCIEARIA/A6400-Extra-Menu)（V3.9 SSLF）移植并针对 A7R4A 的新平台特性与 61MP 高像素场景完成深度适配与实机验证。
 
-*開發中的 A6400 自製觸控選單實機展示。*
+> 本项目沿用上游 **PolyForm Noncommercial 1.0.0** 协议（见 [LICENSE](LICENSE)），仅用于个人研究与非商业用途。仓库内**不包含**任何 Sony 原厂固件、专有 `.so` 函式库、内存 dump 或私人凭据。
 
-以 **MENU＋放大鏡** 召喚自製觸控選單，在相機上管理 LUT 開關和 Film 選項的研究專案。
+---
 
-**本專案仍在持續開發與更新，目前處於實驗階段。** 選單操作、LUT 管理與拍攝後處理會隨實機驗證逐步完善；已驗證的功能、已知限制及待完成項目會同步更新在下方的「實際進度」與 [功能狀態](docs/功能狀態.md) 中。
+## 核心特性与实机验证状态
 
-主要文件使用繁體中文。本專案採 **PolyForm Noncommercial 1.0.0**：允許在授權範圍內免費研究、使用、修改與分享，商業用途須另取得相關權利人的授權。這是**非商業用途的公開原始碼專案（source-available）**，不是 OSI 定義的開源軟件。正式條款見 [LICENSE](LICENSE)，中文重點見 [授權說明](docs/授權說明.md)。
+截至 **2026-11-22**，`ILCE-7RM4A Ver. 1.12` 实机已完成以下验证：
 
-## 這個版本包含甚麼？
+| 模块 | 状态 | 实机验证细节 |
+| --- | --- | --- |
+| **冷启动脱机持久化** | 已通过 | `/tmp/gpslogdiag.so`（`Ir 0a0_geo_res`）+ Backup NVRAM 标志触发 `/etc/a7r4a_film/boot.sh`（3 阶段隔离验证：`stage1` → `stage2` → `full`） |
+| **UI Hook 与实时触控菜单** | 已通过 | `C1+C2`（或 `MENU+C1`）呼出 V3.9 触控菜单；`SCHED_FIFO` 优先级防抢占将 `PTRACE` 冻结+注入总耗时从 15.8–35.6s 降至 **120–138 ms**，彻底消除冷启动互锁 |
+| **61MP 流式胶片渲染** | 已通过 | `a7r4a-film-job.elf` 支持 `Fast 4MP` / `Medium 15MP` / `Full 61MP (9504×6336)`，带内存预算自动降档（`scale=1→2→4`）与 61MP `q=85` 体积优化，实机冷启动已独立产出 `9504×6336`（16 MB）及多张缩放成片 |
+| **双卡槽（Slot 1 / Slot 2）与大文件过滤** | 已通过 | 读取 `im.elf` 内存 `libInfraFsys.so` 自动映射 `A:/` / `B:/` 盘符；支持 `uint64_t` 文件大小与 `.DS_Store` / `.ARW` / >4 GiB 非 JPEG 文件安全跳过 |
+| **Sony MWF 并发日志与非致命失败容错** | 已通过 | 放行 `[MWF] [RsrcAcsr]` 与 `[GetStillTargetMaxFileSize]` 正常并发输出，写卡前干净失败不再误升级为 `exit=21` 杀死守护进程 |
+| **一键安装与无痕卸载/恢复** | 已通过 | `scripts/autoboot_flash.sh install \| status \| uninstall`（先校验后写入，`/tmp/disable_hook` + Backup 标志可秒级还原出厂状态） |
 
-- 自製選單、觸控命中判斷、重複召喚及 Close 邏輯。
-- LUT ON／OFF、Film 選擇與設定保留；關閉選單不等於關閉 LUT。
-- 設定快照驗證、背景派工條件及只讀設定工具。
-- 新照片掃描器、原生檔案命令轉接層，以及另存工作的協調程式。
-- 相機原生 UI 的研究用接駁程式、版本檢查和編譯腳本。
-- 可在電腦執行的合成資料測試；不需要相機或 Sony 韌體。
+---
 
-**這是研究用原始碼公開版，並非可直接複製到 SD 卡的完整安裝包。** 原生 UI 接駁使用特定實機版本的地址與佈局，不能假設適用於其他機身或韌體。
+## 目录结构
 
-## 實際進度
+- `camera/`：相机端 C / 汇编 / Shell 源码（UI Hook、Load Guard、Preload Trigger、Capture Daemon、Native Command、61MP Film Job、RAM Job 调度脚本）
+- `host-tests/`：交叉编译脚本（`build_all_a7r4a.sh` 及各模块独立构建脚本）
+- `scripts/`：主机端 E2E 与刷写工具（`autoboot_flash.sh`、`phase6_ram_e2e.sh`、`inspect_a7r4_elf.py`、`phase4b_61mp_bench.py`、`phase4b_elf_smoke.py`）
+- `tools/`：公开树检查与打包辅助工具（`check_public_tree.py`、`pack_req.py`、`cube_to_a7r4a_lut.py`）
+- `test_*.py`：无需相机的桌面端单元测试套件（已通过 208+ 项回归测试）
+- `docs/`：详细技术文档（[TECHNICAL_ARCHITECTURE.md](docs/TECHNICAL_ARCHITECTURE.md)）与交接文档（[HANDOFF.md](docs/HANDOFF.md)）
 
-截至 2026 年 11 月 15 日的研究記錄：
+---
 
-| 項目 | 狀態 |
-| --- | --- |
-| MENU＋放大鏡召喚、觸控 Close、重複開關 | 已有實機測試確認 |
-| LUT／Film 切換、Close 後保留設定 | 已有實機測試確認 |
-| 關閉後原生按鍵與觸控恢復正常 | 已有多輪實機測試確認 |
-| 新 JPEG 自動派工、另存 Kodak Gold 並核對原片 | 曾完成一次完整實機驗證 |
-| OFF 不處理、切換 Tri-X 後自動另存黑白版 | 尚未驗收；最新一輪原生讀檔失敗後停止 |
-| 新版整合程式冷開機自動載入 | 尚未完成驗收 |
-| 即時取景套色、影片 LUT、任意 `.cube` 匯入 | 此公開版沒有提供 |
+## 快速开始
 
-「Film」目前是背景工作使用的預設名稱，不代表已經移植 Sony 原生 Picture Profile，也不代表每個選項的完整拍攝流程都已通過。詳見 [功能狀態與限制](docs/功能狀態.md)。
-
-## 濾鏡實作的授權界線
-
-私下研究版本曾接駁 DevCrashDay/a6400 的五款預設。該專案在本次核對的版本**沒有授權檔案**，所以本公開版**不附上其濾鏡實作、衍生曲線或包含它們的執行檔**。選單中的五個名稱只保留為控制介面識別字。
-
-因此，這份原始碼本身不會產生那五款濾鏡效果。後續須取得上游授權，或接駁有明確再散布許可的獨立效果引擎。參見 [第三方來源](THIRD_PARTY.md)。
-
-## 在電腦上執行測試
-
-需要 Python 3.10 以上、C 編譯器，以及一般 POSIX 開發環境。測試只在暫存目錄操作合成資料，**不會連接相機、修改記憶體或掛載 SD 卡**。
+### 1. 运行主机单元测试（无需相机）
 
 ```sh
 python3 -m unittest discover -p 'test_*.py' -v
 ```
 
-相機端編譯另見 [編譯與目錄說明](docs/編譯與目錄.md)。
+### 2. 交叉编译相机端产物
 
-## 研究上的界線
+需在仓库同级（或通过环境变量指定）准备 ARMv7 交叉编译工具链、`libjpeg-arm` 及本地提取的相机库目录（见 [docs/TECHNICAL_ARCHITECTURE.md](docs/TECHNICAL_ARCHITECTURE.md)）：
 
-相機原生 UI 與媒體管理路徑仍在調試。過往版本曾出現黑屏、卡住或輸入失靈，斷電後恢復；目前沒有證據足以保證所有狀態都安全。請先閱讀程式與版本檢查，不要把測試通過理解成可以直接安裝。
+```sh
+bash host-tests/build_all_a7r4a.sh ./dist_a7r4a
+(cd dist_a7r4a && shasum -a 256 -c SHA256SUMS)
+```
 
-拍攝時不應從另一個 Linux 掛載點直接讀寫相機正在管理的 SD 卡。原片與輸出必須分開；完成狀態不確定時，協調程式保留現場並停止後續派工。
+### 3. 纯内存试运行 / 持久化刷写 / 卸载
 
-## 授權與貢獻
+相机开机并设为 **大容量存储（Mass Storage）** USB 模式连接电脑：
 
-- 本專案新增部分：[PolyForm Noncommercial 1.0.0](LICENSE)。
-- 沿用的 MIT 研究元件：維持其原有授權及聲明，見 [THIRD_PARTY.md](THIRD_PARTY.md)。
-- Sony 韌體、專有函式庫、記憶體 dump、未經指定公開的照片、音檔、私人 LUT 及憑證均不在本倉庫內。
-- 歡迎提交自己有權提供的修正與研究結果，見 [貢獻指南](CONTRIBUTING.md)。
+```sh
+# 仅在 /tmp_bt RAM 中试运行（断电即恢复出厂）
+./scripts/phase6_ram_e2e.sh check
+./scripts/phase6_ram_e2e.sh start
 
-## 致謝
+# 持久化安装（支持 A7R4A_BOOT_STAGE=stage1|stage2|full，默认 full）
+sudo env A7R4A_BOOT_STAGE=full ./scripts/autoboot_flash.sh install
 
-感謝 **ivica00** 的 A6400 研究、**DevCrashDay** 的 homebrew 與 The Ritual 探索，以及 **ma1co／Sony-PMCA-RE 貢獻者**提供的研究工具。這些公開成果，讓我們有機會繼續替 A6400 嘗試新的操作方式。
+# 查看机内运行状态与 /tmp_bt 日志
+sudo ./scripts/autoboot_flash.sh status
 
-我們希望把自己補上的選單與控制程式整理清楚，回饋願意一起研究的人。完整致謝見 [致謝與致敬](ACKNOWLEDGEMENTS.md)。
+# 彻底卸载并恢复 Backup 标志为出厂默认
+sudo ./scripts/autoboot_flash.sh uninstall
+```
 
-Sony、Kodak、Fujifilm、CineStill 等名稱僅用來描述相容性或介面選項。本專案並非上述公司的官方產品。
+> **使用提示**：`Full 61MP (9504×6336)` 单张渲染耗时约 **88–105 秒**。若使用 61MP 档位，请将相机菜单中的「省电开始时间」设为 **5 分钟或更长**，避免渲染期间机身进入休眠卸载存储卡。日常抓拍推荐使用 **`Fast 4MP`** 或 **`Medium 15MP`**。
+
+---
+
+## 更多文档
+
+- [技术架构与移植详解（docs/TECHNICAL_ARCHITECTURE.md）](docs/TECHNICAL_ARCHITECTURE.md)
+- [下一会话交接文档（docs/HANDOFF.md）](docs/HANDOFF.md)
+- [功能状态](docs/功能狀態.md) · [编译与目录说明](docs/編譯與目錄.md) · [授权说明](docs/授權說明.md)
+
+## 致谢
+
+感谢 [PCIEARIA/A6400-Extra-Menu](https://github.com/PCIEARIA/A6400-Extra-Menu)、**ivica00**、**DevCrashDay** 与 **ma1co / Sony-PMCA-RE** 贡献者们的开源与研究工作。完整致谢与第三方声明见 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) 与 [THIRD_PARTY.md](THIRD_PARTY.md)。

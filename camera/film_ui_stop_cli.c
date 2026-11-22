@@ -5,6 +5,11 @@
 #include "film_settings_source.h"
 #include "film_settings_maps.h"
 #include "film_ui_stop_build.h"
+#ifdef A7R4A_DYNAMIC_IDENTITY
+#include "a7r4a_target.h"
+#include <dirent.h>
+#include <stdlib.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -21,20 +26,45 @@ _Static_assert(FILM_UI_STOP_CONTROL_RVA<FILM_UI_STOP_UI_RVA ||
 
 struct observed {
     uint32_t base,state,control,request;
+    uint32_t expected_system,expected_tid;
     unsigned char first[FILM_UI_SNAPSHOT_BYTES],second[FILM_UI_SNAPSHOT_BYTES];
 };
+static char g_proc_root[64];
+
 static uint32_t word(const void *p,unsigned at) {
     uint32_t value;memcpy(&value,(const unsigned char *)p+at,4);return value;
 }
 static int fail(const char *reason) {
     printf("FILM_UI_STOP_UNAVAILABLE reason=%s\n",reason);return 11;
 }
+static int resolve_proc_root(void) {
+#ifdef A7R4A_DYNAMIC_IDENTITY
+    if(!strcmp(FILM_UI_STOP_PROC,"/proc/auto")) {
+        DIR *dir=opendir("/proc");if(!dir)return 0;
+        struct dirent *entry;long found=-1;unsigned matches=0;
+        while((entry=readdir(dir))) {
+            char *end=NULL;long pid=strtol(entry->d_name,&end,10);
+            if(!*entry->d_name || *end || pid<=0)continue;
+            char fpath[64],comm[32]={0};snprintf(fpath,sizeof(fpath),"/proc/%ld/comm",pid);
+            FILE *f=fopen(fpath,"r");if(!f)continue;
+            int ok=fgets(comm,sizeof(comm),f) && !strcmp(comm,A7R4A_PROC_COMM "\n");
+            fclose(f);if(ok){found=pid;++matches;}
+        }
+        closedir(dir);
+        if(matches!=1u || found<=0)return 0;
+        int n=snprintf(g_proc_root,sizeof(g_proc_root),"/proc/%ld",found);
+        return n>0 && (unsigned)n<sizeof(g_proc_root);
+    }
+#endif
+    int n=snprintf(g_proc_root,sizeof(g_proc_root),"%s",FILM_UI_STOP_PROC);
+    return n>0 && (unsigned)n<sizeof(g_proc_root);
+}
 static int path(char *out,unsigned capacity,const char *name) {
-    int n=snprintf(out,capacity,"%s/%s",FILM_UI_STOP_PROC,name);
+    int n=snprintf(out,capacity,"%s/%s",g_proc_root,name);
     return n>0 && (unsigned)n<capacity;
 }
 static int identity(char start[24]) {
-    char file[512],line[1024];
+    char file[512],line[1024],prefix[48];
     if(!path(file,sizeof(file),"comm"))return 0;
     FILE *f=fopen(file,"r");
     if(!f)return 0;
@@ -42,8 +72,10 @@ static int identity(char start[24]) {
     fclose(f);if(!ok || !path(file,sizeof(file),"stat"))return 0;
     f=fopen(file,"r");if(!f)return 0;
     ok=fgets(line,sizeof(line),f)!=0;fclose(f);
-    if(!ok || strncmp(line,"149 (im.elf) ",13))return 0;
-    char *p=line+13;
+    const char *pid_str=g_proc_root+6;
+    int pn=snprintf(prefix,sizeof(prefix),"%s (im.elf) ",pid_str);
+    if(!ok || pn<=0 || (unsigned)pn>=sizeof(prefix) || strncmp(line,prefix,(size_t)pn))return 0;
+    char *p=line+pn;
     for(unsigned field=3;field<22;field++) {
         if(!*p || *p=='\n')return 0;
         while(*p && *p!=' ' && *p!='\n')++p;
@@ -70,10 +102,6 @@ static const char *outer_stopped(void) {
        !absent(FILM_UI_STOP_JOB_LOCK))return "outer_busy";
     return 0;
 }
-/* The final zero-fill page of an ELF LOAD has no pathname in /proc/maps.
- * Derive only this reviewed module's exact continuation from its pinned ELF;
- * an arbitrary writable anonymous neighbor is never an owned control range.
- * This camera's reviewed ARM32 mappings use 4 KiB pages. */
 struct bss_geometry {
     uint32_t image_page,segment_page,file_page,memory_page,offset_bias;
 };
@@ -147,12 +175,27 @@ static int mapping(struct observed *out) {
     struct film_settings_map ui={0};unsigned control_count=0,control_ranges=0;uint32_t control=0;
     struct bss_geometry bss={0};int have_bss=bss_geometry(&bss);
     struct stop_mapping previous={0},image={0};int have_previous=0,have_image=0,ok=1;
+#ifdef A7R4A_DYNAMIC_IDENTITY
+    uint32_t libobj_base=0,view2_base=0;unsigned libobj_n=0,view2_n=0;
+#endif
     while(fgets(line,sizeof(line),f)) {
         size_t length=strlen(line);
         if(length==sizeof(line)-1 && line[length-1]!='\n'){ok=0;break;}
         struct stop_mapping current={0};
         if(!map_record(&current,line) || (have_previous && current.low<previous.high)){ok=0;break;}
         film_settings_map_line(&ui,line,FILM_UI_STOP_MODULE,FILM_UI_STOP_UI_RVA);
+#ifdef A7R4A_DYNAMIC_IDENTITY
+        {
+            unsigned lo2=0,hi2=0,off2=0;char p2[5]={0};int at2=0;
+            if(sscanf(line,"%x-%x %4s %x %*s %*s %n",&lo2,&hi2,p2,&off2,&at2)==4 && at2>0) {
+                size_t l2=strcspn(line+at2,"\r\n");
+                if(!off2 && !strcmp(p2,"r-xp")) {
+                    if(l2==strlen(A7R4A_LIBOBJ_PATH) && !memcmp(line+at2,A7R4A_LIBOBJ_PATH,l2)){libobj_base=lo2;++libobj_n;}
+                    else if(l2==strlen(A7R4A_VIEW2_PATH) && !memcmp(line+at2,A7R4A_VIEW2_PATH,l2)){view2_base=lo2;++view2_n;}
+                }
+            }
+        }
+#endif
         if(current.module && !current.offset && !strcmp(current.permissions,"r-xp")) {
             image=current;++have_image;
         }
@@ -183,6 +226,14 @@ static int mapping(struct observed *out) {
     }
     ok=ok && !ferror(f);fclose(f);
     if(!ok || ui.image_count!=1 || ui.state_count!=1 || control_ranges!=1 || control_count!=1)return 0;
+#ifdef A7R4A_DYNAMIC_IDENTITY
+    if(libobj_n!=1u || view2_n!=1u || !libobj_base || !view2_base)return 0;
+    out->expected_system=libobj_base+A7R4A_SYSTEM_PTR_RVA;
+    out->expected_tid=view2_base+A7R4A_STATE_RVA;
+#else
+    out->expected_system=0x956f0u;
+    out->expected_tid=380u;
+#endif
     out->base=ui.base;out->state=ui.state;out->control=control;return 1;
 }
 static const char *read_state(int fd,struct observed *out) {
@@ -192,28 +243,35 @@ static const char *read_state(int fd,struct observed *out) {
        pread(fd,out->second,sizeof(out->second),out->state)!=sizeof(out->second) ||
        pread(fd,&second,4,out->control)!=4)
         return "read";
+#ifdef A7R4A_DYNAMIC_IDENTITY
+    uint32_t exp_sys=0,trace_hdr[12]={0};
+    if(pread(fd,&exp_sys,4,out->expected_system)!=4 ||
+       pread(fd,trace_hdr,sizeof(trace_hdr),out->expected_tid)!=sizeof(trace_hdr))
+        return "read";
+    if(!exp_sys || trace_hdr[0]!=A7R4A_TRACE_MAGIC || trace_hdr[1]!=1u ||
+       trace_hdr[8]!=1u || !trace_hdr[9] || trace_hdr[10]!=exp_sys)
+        return "state";
+    uint32_t exp_tid=trace_hdr[9];
+#else
+    uint32_t exp_sys=out->expected_system,exp_tid=out->expected_tid;
+#endif
     if(first>2u || second>2u)return "control";
     if(first!=second)return "transition";
     out->request=second;
     if(second==2u) {
-        /* A stopped ticker no longer supplies a heartbeat. Acknowledge only
-         * the same attached UI identity and two stable inactive snapshots. */
         static const unsigned fixed[]={0x68,0xc0,0xc4,0x18c,0x190};
         if(memcmp(out->first,out->second,16))return "state";
         for(unsigned i=0;i<sizeof(fixed)/sizeof(*fixed);i++)
             if(word(out->first,fixed[i])!=word(out->second,fixed[i]))return "state";
-        if(word(out->second,0x68)!=0x956f0u || word(out->second,0xc0)!=380u ||
+        if(word(out->second,0x68)!=exp_sys || word(out->second,0xc0)!=exp_tid ||
            !word(out->second,0xc4) || word(out->second,0x18c)!=1u ||
            word(out->second,0x190)!=0u)return "state";
         return 0;
     }
     uint32_t now;struct film_settings settings;
     if(film_settings_now(&now))return "state";
-    int snapshot=film_settings_snapshot_get(&settings,out->first,
-        out->second,sizeof(out->first),now);
-    /* The natural callback clears running before publishing ACK=2. While our
-     * request is pending, retry this inactive/torn window within the existing
-     * deadline; it is never an acknowledgement or permission for a write. */
+    int snapshot=film_settings_snapshot_get_for(&settings,out->first,
+        out->second,sizeof(out->first),now,exp_sys,exp_tid);
     if(snapshot)return second==1u && (snapshot==1 || snapshot==2)?"transition":"state";
     return 0;
 }
@@ -226,23 +284,95 @@ static const char *still_same(const struct observed *original,const char *start)
        map.control!=original->control)return "maps";
     return 0;
 }
+#ifdef A7R4A_DYNAMIC_IDENTITY
+static int dump_state_trace(void) {
+    if(!resolve_proc_root())return fail("identity");
+    char start[24];if(!identity(start))return fail("identity");
+    char file[512],line[1024];
+    if(!path(file,sizeof(file),"maps"))return fail("maps");
+    FILE *f=fopen(file,"r");if(!f)return fail("maps");
+    uint32_t view2_base=0,state_va=0,rw_hi=0;
+    unsigned view2_n=0;int prev_rw=0,state_ok=0,ok=1;
+    while(fgets(line,sizeof(line),f)) {
+        size_t len=strlen(line);
+        if(len==sizeof(line)-1 && line[len-1]!='\n'){ok=0;break;}
+        unsigned lo=0,hi=0,off=0;char p[5]={0},dev[16]={0},inode[24]={0};int at=0;
+        if(sscanf(line,"%x-%x %4s %x %15s %23s %n",&lo,&hi,p,&off,dev,inode,&at)!=6 ||
+           at<=0 || lo>=hi){ok=0;break;}
+        size_t plen=strcspn(line+at,"\r\n");
+        int is_v2=(plen==strlen(A7R4A_VIEW2_PATH) && !memcmp(line+at,A7R4A_VIEW2_PATH,plen));
+        int is_anon=(!plen && !off && !strcmp(dev,"00:00") && !strcmp(inode,"0"));
+        if(!off && !strcmp(p,"r-xp") && is_v2) {
+            view2_base=lo;state_va=lo+A7R4A_STATE_RVA;++view2_n;
+        }
+        if(!strcmp(p,"rw-p") && view2_n==1u &&
+           (is_v2 || (is_anon && prev_rw && lo==rw_hi))) {
+            if(state_va>=lo && state_va+A7R4A_STATE_SIZE<=hi)state_ok=1;
+            rw_hi=hi;prev_rw=1;
+        } else prev_rw=0;
+    }
+    ok=ok && !ferror(f);fclose(f);
+    if(!ok || view2_n!=1u || !view2_base || !state_ok)return fail("maps");
+    if(!path(file,sizeof(file),"mem"))return fail("read");
+    int fd=open(file,O_RDONLY);if(fd<0)return fail("read");
+    unsigned char buf[A7R4A_STATE_SIZE];
+    ssize_t got=pread(fd,buf,sizeof(buf),state_va);
+    close(fd);
+    if(got!=(ssize_t)sizeof(buf))return fail("read");
+    printf("LOADER magic=0x%08x ver=%u en=%u cnt=%u inf=%u cap=%u err=%u exp_sys=0x%08x\n",
+           word(buf,0),word(buf,4),word(buf,8),word(buf,12),
+           word(buf,16),word(buf,20),word(buf,24),word(buf,28));
+    if(word(buf,12)>0u) {
+        const unsigned char *e=buf+32u;
+        printf("EVENT0 seq=%u tid=%u sys=0x%08x before=0x%x mouse=%u after=0x%x raw=0x%x btn=0x%x mod=0x%08x attach=%d native=0x%x tag=0x%x\n",
+               word(e,0),word(e,4),word(e,8),word(e,12),word(e,16),word(e,20),
+               word(e,24),word(e,28),word(e,32),(int)word(e,36),word(e,40),word(e,44));
+    }
+    const unsigned char *tr=buf+A7R4A_TRACE_OFFSET;
+    printf("TRACE_HDR magic=0x%08x ver=%u seq=%u ms=%u pid=%u tid=%u cap=%u rec=%u\n",
+           word(tr,0),word(tr,4),word(tr,8),word(tr,16),
+           word(tr,20),word(tr,24),word(tr,28),word(tr,32));
+    uint32_t seq=word(tr,8);
+    if(word(tr,0)==0x33544955u && seq>0u) {
+        uint32_t count=seq<22u?seq:22u;
+        uint32_t first_seq=seq-count+1u;
+        for(uint32_t s=first_seq;s<=seq;s++) {
+            const unsigned char *r=tr+48u+((s-1u)%22u)*48u;
+            uint32_t g0=word(r,0),g1=word(r,44);
+            if(g0!=g1 || (g0&1u)!=0u || (g0>>1)!=s)continue;
+            printf("TRACE_REC seq=%u hash=0x%08x ms=%u tid=%u a=%d b=%d ticks=%u flags=0x%x\n",
+                   s,word(r,4),word(r,8),word(r,12),(int)word(r,16),(int)word(r,20),
+                   word(r,24),word(r,28));
+        }
+    }
+    return 0;
+}
+#endif
 int main(int argc,char **argv) {
-    /* The camera's raw SYS_exit startup does not flush fully buffered pipes. */
     if(setvbuf(stdout,NULL,_IONBF,0)) {
         int result=fail("stdout_buffering");(void)fflush(stdout);return result;
     }
     int request=argc==2 && !strcmp(argv[1],"--request");
-    if(argc!=2 || (!request && strcmp(argv[1],"--check"))) {
-        fprintf(stderr,"usage: a6400-film-ui-stop.elf --check | --request\n"
+    int dump_trace=argc==2 && !strcmp(argv[1],"--dump-trace");
+    if(argc!=2 || (!request && !dump_trace && strcmp(argv[1],"--check"))) {
+        fprintf(stderr,"usage: a6400-film-ui-stop.elf --check | --request | --dump-trace\n"
             "Stop dispatch and wait for capture/jobs to exit before --request.\n"
             "Create " FILM_UI_STOP_MARKER "; all capture/inflight/job locks must be absent.\n"
             "This tool does not manage jobs, call Sony, remove hooks or unload the UI.\n");
         return 2;
     }
+    if(dump_trace) {
+#ifdef A7R4A_DYNAMIC_IDENTITY
+        return dump_state_trace();
+#else
+        return fail("unsupported");
+#endif
+    }
     const char *reason=request?outer_stopped():0;
     if(reason)return fail(reason);
     if(!film_file_matches(FILM_UI_STOP_MODULE,FILM_UI_STOP_MODULE_BYTES,
                           FILM_UI_STOP_MODULE_FNV))return fail("artifact");
+    if(!resolve_proc_root())return fail("identity");
     char start[24];if(!identity(start))return fail("identity");
     struct observed state={0};if(!mapping(&state))return fail("maps");
     char file[512];if(!path(file,sizeof(file),"mem"))return fail("read");
@@ -260,7 +390,6 @@ int main(int argc,char **argv) {
     if(reason){close(fd);return fail(reason);}
     if(state.request==0u) {
         const unsigned stop=1u;
-        /* The sole write is the four-byte exported owned control symbol. */
         if(pwrite(fd,&stop,sizeof(stop),state.control)!=sizeof(stop)) {
             close(fd);return fail("write");
         }

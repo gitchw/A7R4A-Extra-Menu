@@ -10,8 +10,8 @@ static inline uint32_t ui_trial_hash(const char *name) {
     for(unsigned i=0;i<64 && name[i];i++)value=(value^(unsigned char)name[i])*16777619u;
     return value;
 }
-static inline void ui_trial_record(volatile struct ui_trial_trace *trace,
-    const char *name,uint32_t ms,uint32_t tid,uint32_t a,uint32_t b,
+static inline void ui_trial_record_pid(volatile struct ui_trial_trace *trace,
+    const char *name,uint32_t ms,uint32_t pid,uint32_t tid,uint32_t a,uint32_t b,
     uint32_t ticks,uint32_t flags) {
     uint32_t seq=trace->header[2]+1u;
     volatile uint32_t *r=trace->records[(seq-1u)%22u];
@@ -22,8 +22,13 @@ static inline void ui_trial_record(volatile struct ui_trial_trace *trace,
     __sync_synchronize();r[11]=seq*2u;
     __sync_synchronize();r[0]=seq*2u;
     trace->header[0]=0x33544955u;trace->header[1]=1;
-    trace->header[4]=ms;trace->header[5]=149;trace->header[6]=tid;
+    trace->header[4]=ms;trace->header[5]=pid;trace->header[6]=tid;
     trace->header[7]=22;trace->header[8]=48;
     __sync_synchronize();trace->header[2]=seq;
+}
+static inline void ui_trial_record(volatile struct ui_trial_trace *trace,
+    const char *name,uint32_t ms,uint32_t tid,uint32_t a,uint32_t b,
+    uint32_t ticks,uint32_t flags) {
+    ui_trial_record_pid(trace,name,ms,149u,tid,a,b,ticks,flags);
 }
 #endif

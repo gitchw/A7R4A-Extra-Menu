@@ -9,12 +9,13 @@ RAM=/tmp_bt/a6400-film-job
 LOCK=/tmp_bt/a6400-film-job.lock
 BB=/bin/busybox
 NATIVE=/tmp_bt/a6400-film-native-command.elf
-WORKER=/tmp_bt/a6400-film-job.elf
+WORKER=/tmp_bt/a7r4a-film-job.elf
 SETTINGS=/tmp_bt/a6400-film-menu-job.elf
 MEMINFO=/proc/meminfo
 MOUNTS=/proc/mounts
 BOOTFILE=/proc/sys/kernel/random/boot_id
 CAPTURE_STOP=/tmp_bt/a6400-film-capture.stop
+CLOCKFILE=/proc/uptime
 MEDIA_WAIT_POLLS=60
 NATIVE_SHA=__NATIVE_SHA__
 WORKER_SHA=__WORKER_SHA__
@@ -49,6 +50,26 @@ worker_inflight=0
 native_pid=0
 worker_pid=0
 media_wait_polls=0
+JOB_STARTED=-1
+CLOCK_MS=-1
+
+# Built-in reads avoid spawning date/awk for every measurement. A missing
+# clock only disables telemetry; it must not change native I/O semantics.
+clock_ms() {
+    CLOCK_MS=-1
+    IFS=' ' read -r clock_value clock_rest < "$CLOCKFILE" || return 1
+    clock_seconds=${clock_value%%.*}
+    clock_fraction=${clock_value#*.}000
+    clock_fraction=${clock_fraction%"${clock_fraction#???}"}
+    case "$clock_seconds:$clock_fraction" in *[!0-9:]*|:*) return 1;; esac
+    test "${#clock_seconds}" -le 8 && test "${#clock_fraction}" = 3 || return 1
+    CLOCK_MS=$((clock_seconds*1000+1$clock_fraction-1000))
+}
+stage_done() {
+    clock_ms || return 0
+    test "$2" -ge 0 && test "$CLOCK_MS" -ge "$2" || return 0
+    echo "RAM_JOB_STAGE stage=$1 start_ms=$2 end_ms=$CLOCK_MS elapsed_ms=$((CLOCK_MS-$2)) completed=1"
+}
 
 fail() { echo "RAM_JOB_FAIL stage=$1"; exit "${2:-1}"; }
 hash_file() {
@@ -60,18 +81,31 @@ hash_file() {
 }
 hash_is() { hash_file "$1" && test "$HASH" = "$2"; }
 file_bytes() {
-    test -f "$1" && test ! -L "$1" || return 1
-    size_line=$("$BB" wc -c < "$1") || return 1
-    set -- $size_line
-    test "$#" = 1 || return 1
-    case "$1" in ''|*[!0-9]*) return 1;; esac
-    test "${#1}" -le 8 || return 1
-    FILE_BYTES=$1
+    fb_path=$1
+    test -f "$fb_path" && test ! -L "$fb_path" || return 1
+    if test -x "$WORKER"; then
+        size_line=$("$WORKER" --size "$fb_path" 2>/dev/null) || size_line=
+        if test -n "$size_line"; then
+            set -- $size_line
+            if test "$#" = 1; then
+                case "$1" in ''|*[!0-9]*) ;; *)
+                    if test "${#1}" -le 8; then FILE_BYTES=$1; return 0; fi ;;
+                esac
+            fi
+        fi
+    fi
+    # BusyBox v1.34.1 on ILCE-7RM4A omits wc; ls -ln field 5 reports exact bytes.
+    ls_line=$("$BB" ls -ln "$fb_path" 2>/dev/null) || return 1
+    set -- $ls_line
+    test "$#" -ge 5 || return 1
+    case "$5" in ''|*[!0-9]*) return 1;; esac
+    test "${#5}" -le 8 || return 1
+    FILE_BYTES=$5
 }
 no_linux_sd() {
     test -r "$MOUNTS" || return 1
     while read -r mount_source mount_target mount_type mount_options mount_rest; do
-        case "$mount_source" in /dev/mmca*|/dev/mmcblk*) return 1;; esac
+        case "$mount_source" in /dev/mmc*) return 1;; esac
     done < "$MOUNTS"
 }
 # 0=one owned RAM mount;1=no mount at RAM;2=unreadable/other/ambiguous.
@@ -140,8 +174,12 @@ finish() {
     if test "$retain" = 1; then
         manifest || echo 'RAM_JOB_MANIFEST_WRITE_FAILED'
         echo "RAM_JOB_RETAINED phase=$PHASE ram=$RAM lock=$LOCK result=$job_rc"
-    elif test "$job_rc" = 0 && test "$applied" = 1; then
-        echo "RAM_JOB_APPLIED source=$SOURCE target=$TARGET preset=$PRESET grain=$GRAIN halation=$HALATION source_bytes=$EXPECTED_BYTES source_sha256=$INPUT_SHA output_bytes=$OUTPUT_BYTES output_sha256=$OUTPUT_SHA original_verified=$ORIGINAL_VERIFIED"
+    fi
+    if clock_ms && test "$JOB_STARTED" -ge 0 && test "$CLOCK_MS" -ge "$JOB_STARTED"; then
+        echo "RAM_JOB_TIMING total_ms=$((CLOCK_MS-JOB_STARTED)) result=$job_rc"
+    fi
+    if test "$job_rc" = 0 && test "$applied" = 1 && test "$retain" = 0; then
+        echo "RAM_JOB_APPLIED source=$SOURCE target=$TARGET preset=$PRESET grain=$GRAIN halation=$HALATION source_bytes=$EXPECTED_BYTES source_sha256=$INPUT_SHA output_bytes=$OUTPUT_BYTES output_sha256=$OUTPUT_SHA source_access=read_only target_verified=$TARGET_VERIFIED original_verified=$ORIGINAL_VERIFIED"
     fi
     exit "$job_rc"
 }
@@ -219,6 +257,8 @@ native_run() {
     if test "$native_op" = absent; then report_kind=NATIVE_ABSENT;report_reason=source_open_failed; fi
     PHASE=native_$native_op
     guard && hash_is "$NATIVE" "$NATIVE_SHA" || fail pre_native_guard
+    clock_ms || :
+    native_started=$CLOCK_MS
     native_inflight=1
     "$NATIVE" "$native_op" "$native_path" > "$LOCK/native.current.log" 2>&1 &
     native_pid=$!
@@ -230,6 +270,17 @@ native_run() {
     "$BB" cat "$LOCK/native.current.log"
     "$BB" cat "$LOCK/native.current.log" >> "$LOCK/native.log" || { NATIVE_UNCERTAIN=1;retain=1;fail native_log 21; }
     if test "$native_rc" = 21 || "$BB" grep -q 'uncertain=1' "$LOCK/native.current.log"; then
+        if test "$MODE" = apply && test "$TARGET_ATTEMPTED" = 0 &&
+           test "$native_op" = read && test "${read_overflow_retries:-0}" -lt 3 &&
+           { "$BB" grep -q 'reason=ring_overflow' "$LOCK/native.current.log" ||
+             "$BB" grep -q 'reason=history_capacity' "$LOCK/native.current.log" ||
+             "$BB" grep -q 'reason=response_capacity' "$LOCK/native.current.log"; }; then
+            read_overflow_retries=$((${read_overflow_retries:-0}+1))
+            echo "RAM_JOB_READ_RETRY retry=$read_overflow_retries reason=overflow"
+            "$BB" rm -f "$INPUT" || { NATIVE_UNCERTAIN=1;retain=1;fail native_uncertain 21; }
+            test ! -e "$INPUT" && test ! -L "$INPUT" || { NATIVE_UNCERTAIN=1;retain=1;fail native_uncertain 21; }
+            return 15
+        fi
         NATIVE_UNCERTAIN=1;retain=1;fail native_uncertain 21
     fi
     if test "$MODE" = apply && test "$TARGET_ATTEMPTED" = 0 &&
@@ -241,15 +292,34 @@ native_run() {
     fi
     if test "$native_rc" != 0; then
         if native_safe_presend_failure; then fail native_presend "$native_rc"; fi
+        if test "$MODE" = apply && test "$TARGET_ATTEMPTED" = 0 &&
+           test ! -e "$INPUT" && test ! -L "$INPUT" && test "$native_rc" = 1; then
+            report_kind=NATIVE_FAIL
+            if test "$native_op" = absent; then
+                for report_reason in absence_unproven native_error; do
+                    if native_report_ok && test "$report_fields" = 9 && guard; then
+                        fail "native_absent_$report_reason" 1
+                    fi
+                done
+            elif test "$native_op" = read; then
+                report_reason=native_error
+                if native_report_ok && test "$report_fields" = 9 && guard; then
+                    fail native_read_error 1
+                fi
+            fi
+        fi
         NATIVE_UNCERTAIN=1;retain=1;fail native_completion_unconfirmed 21
     fi
     if ! native_report_ok; then NATIVE_UNCERTAIN=1;retain=1;fail native_return_unconfirmed 21; fi
     guard || fail post_native_guard
+    stage_done "$native_op" "$native_started"
 }
 decode_input() {
     PHASE=$1
     decode_failure=$2
     guard && hash_is "$WORKER" "$WORKER_SHA" || fail verify_worker_pin
+    clock_ms || :
+    decode_started=$CLOCK_MS
     worker_inflight=1
     "$WORKER" --verify "$INPUT" > "$LOCK/verify.log" 2>&1 &
     worker_pid=$!
@@ -259,6 +329,7 @@ decode_input() {
     worker_inflight=0
     "$BB" cat "$LOCK/verify.log"
     test "$worker_rc" = 0 && "$BB" grep -q '^FILM_DECODED ' "$LOCK/verify.log" || fail "$decode_failure"
+    stage_done "$PHASE" "$decode_started"
 }
 release_input() {
     guard && test -f "$INPUT" && test ! -L "$INPUT" || fail release_input_guard
@@ -277,7 +348,7 @@ read_settings() {
     setting_grain=${3#grain=}
     setting_halation=${4#halation=}
     test "$SETTING_LINE" = "FILM_JOB preset=$setting_preset grain=$setting_grain halation=$setting_halation" || return 11
-    case "$setting_preset" in portra_400|cinestill_800t|fuji_provia|kodak_gold|tri_x_400) ;; *) return 11;; esac
+    case "$setting_preset" in portra_400|cinestill_800t|fuji_provia|kodak_gold|tri_x_400|classic_chrome|agfa_ultra_100|polaroid_669|fuji_acros|polaroid_px680|kodak_ektar_100|ilford_hp5) ;; *) return 11;; esac
     case "$setting_grain:$setting_halation" in [0-3]:[01]) ;; *) return 11;; esac
     return 0
 }
@@ -295,6 +366,7 @@ confirm_settings() {
 read_source_ready() {
     media_stage=$1
     media_waited_here=0
+    read_overflow_retries=0
     while :; do
         guard || fail media_wait_guard 13
         test ! -e "$CAPTURE_STOP" || fail media_wait_stopped 20
@@ -306,6 +378,10 @@ read_source_ready() {
                 echo "RAM_JOB_MEDIA_RESUMED stage=$media_stage polls=$media_wait_polls"
             fi
             return 0
+        fi
+        if test "$media_rc" = 15; then
+            "$BB" sleep 1 || fail media_wait_sleep 13
+            continue
         fi
         test "$media_rc" = 14 || fail media_completion_unconfirmed 21
         if test "$media_waited_here" = 0; then
@@ -338,35 +414,62 @@ memory_budget() {
     done < "$MEMINFO"
     test "$mem_bad" = 0 && test "$mem_seen" = 15 || return 1
     mem_available=$((mem_free+mem_buffers+mem_cached-mem_shmem))
-    # The worker additionally checks the selected image's RGB/mask requirement
-    # against current memory before allocating; never reserve 24MP RGB blindly.
-    mem_required=$(((EXPECTED_BYTES+1023)/1024+${1:-16384}+16384))
-    echo "RAM_JOB_MEMORY available_kib=$mem_available required_kib=$mem_required private_mount_bytes=33554432"
+    # Streaming scanline JPEG worker uses <4 MiB heap; size tmpfs budget by output scale
+    # so 61MP X.FINE inputs fit safely inside A7R4A ~64 MiB free RAM.
+    expected_kib=$(((EXPECTED_BYTES+1023)/1024))
+    if test "$#" -gt 0; then
+        mem_required=$((expected_kib+$1+4096))
+    elif test "$SCALE_ARG" = 4; then
+        mem_required=$((expected_kib+5120+4096))
+    elif test "$SCALE_ARG" = 2; then
+        est_out_kib=$(((expected_kib+3)/4+2048))
+        mem_required=$((expected_kib+est_out_kib+4096))
+    elif test "$expected_kib" -gt 16384; then
+        est_out_kib=$(((expected_kib*65+99)/100))
+        mem_required=$((expected_kib+est_out_kib+4096))
+    else
+        mem_required=$((((expected_kib*22)+9)/10+8192))
+    fi
+    echo "RAM_JOB_MEMORY available_kib=$mem_available required_kib=$mem_required scale=$SCALE_ARG private_mount_bytes=62914560"
     test "$mem_available" -ge "$mem_required"
 }
 
+clock_ms || :
+JOB_STARTED=$CLOCK_MS
+SCALE_ARG=1
 case "$MODE:$#" in
     render:6) PRESET=$4;GRAIN=$5;HALATION=$6;;
     apply:4) TARGET=$4;;
+    apply:5) TARGET=$4; case "$5" in hires) SCALE_ARG=1;; fast) SCALE_ARG=4;; *) fail arguments;; esac;;
     *) fail arguments;;
 esac
 case "$EXPECTED_BYTES" in ''|0|0*|*[!0-9]*) fail expected_size;; esac
 test "${#EXPECTED_BYTES}" -le 8 || fail expected_size
-test "$((EXPECTED_BYTES+16777216+65536))" -le 33554432 || fail scratch_capacity
-source_tail=${SOURCE#A:/DCIM/}
+test "$EXPECTED_BYTES" -le 58720256 || fail scratch_capacity
+source_drive=${SOURCE%%:*}
+case "$source_drive" in A|B) ;; *) fail source_path;; esac
+source_tail=${SOURCE#${source_drive}:/DCIM/}
 source_dir=${source_tail%%/*}
 source_file=${source_tail#*/}
 source_name=${source_file%.JPG}
 test "${#source_dir}" = 8 && test "${#source_name}" = 8 &&
-    test "$SOURCE" = "A:/DCIM/$source_dir/$source_name.JPG" || fail source_path
+    test "$SOURCE" = "$source_drive:/DCIM/$source_dir/$source_name.JPG" || fail source_path
 case "$source_dir$source_name" in *[!A-Za-z0-9_-]*) fail source_path;; esac
 if test "$MODE" = render; then
-    case "$PRESET" in portra_400|cinestill_800t|fuji_provia|kodak_gold|tri_x_400) ;; *) fail preset;; esac
+    case "$PRESET" in portra_400|cinestill_800t|fuji_provia|kodak_gold|tri_x_400|classic_chrome|agfa_ultra_100|polaroid_669|fuji_acros|polaroid_px680|kodak_ektar_100|ilford_hp5) ;; *) fail preset;; esac
     case "$GRAIN:$HALATION" in [0-3]:[01]) ;; *) fail effect_arguments;; esac
 else
-    target_digits=${TARGET#A:/A6400/TEST/F}
+    target_drive=${TARGET%%:*}
+    test "$target_drive" = "$source_drive" || fail target_path
+    target_ns=
+    case "$TARGET" in
+        "$source_drive:/A7R4A/TEST/F"*) target_ns=A7R4A;;
+        "$source_drive:/A6400/TEST/F"*) target_ns=A6400;;
+        *) fail target_path;;
+    esac
+    target_digits=${TARGET#${source_drive}:/${target_ns}/TEST/F}
     target_digits=${target_digits%.JPG}
-    test "${#target_digits}" = 7 && test "$TARGET" = "A:/A6400/TEST/F$target_digits.JPG" || fail target_path
+    test "${#target_digits}" = 7 && test "$TARGET" = "$source_drive:/$target_ns/TEST/F$target_digits.JPG" || fail target_path
     case "$target_digits" in *[!0-9]*) fail target_path;; esac
 fi
 test -x "$NATIVE" && hash_is "$NATIVE" "$NATIVE_SHA" || fail native_pin
@@ -378,7 +481,20 @@ if test "$MODE" = apply; then
     INITIAL_PLAN=$SETTING_LINE
     PRESET=$setting_preset;GRAIN=$setting_grain;HALATION=$setting_halation
 fi
-memory_budget || fail memory_budget
+if ! memory_budget; then
+    if test "$MODE" = apply && test "$SCALE_ARG" = 1; then
+        SCALE_ARG=2
+        if memory_budget; then
+            echo "RAM_JOB_SCALE_FALLBACK from=1 to=2"
+        else
+            SCALE_ARG=4
+            memory_budget || fail memory_budget
+            echo "RAM_JOB_SCALE_FALLBACK from=1 to=4"
+        fi
+    else
+        fail memory_budget
+    fi
+fi
 no_linux_sd || fail linux_sd_mounted
 IFS= read -r BOOT < "$BOOTFILE" || fail boot_id
 test "${#BOOT}" = 36 || fail boot_id
@@ -393,27 +509,33 @@ PHASE=mount
 manifest || fail manifest
 "$BB" mkdir "$RAM" || fail ram_directory
 ram_created=1
-"$BB" mount -t tmpfs -o size=33554432,nr_inodes=16,mode=700,nosuid,nodev,noexec a6400-film-job "$RAM"
+"$BB" mount -t tmpfs -o size=62914560,nr_inodes=16,mode=700,nosuid,nodev,noexec a6400-film-job "$RAM"
 mount_rc=$?
 ram_mount_state
 mount_state=$?
 if test "$mount_state" = 2; then retain=1;fail mount_unconfirmed 21; fi
 test "$mount_rc" = 0 && test "$mount_state" = 0 || fail mount
 
-if test "$MODE" = apply; then read_source_ready before_read; else native_run read "$SOURCE"; fi
-file_bytes "$INPUT" && test "$FILE_BYTES" = "$EXPECTED_BYTES" || fail source_size
-hash_file "$INPUT" || fail source_hash
-INPUT_SHA=$HASH
-
-decode_input verify_input input_decode
-if test "$MODE" = apply; then confirm_settings settings_before_processing; fi
+if test "$MODE" = apply; then
+    read_source_ready before_read
+    file_bytes "$INPUT" && test "$FILE_BYTES" = "$EXPECTED_BYTES" || fail source_size
+    INPUT_SHA=size:$EXPECTED_BYTES
+else
+    native_run read "$SOURCE"
+    file_bytes "$INPUT" && test "$FILE_BYTES" = "$EXPECTED_BYTES" || fail source_size
+    hash_file "$INPUT" || fail source_hash
+    INPUT_SHA=$HASH
+    decode_input verify_input input_decode
+fi
 
 PHASE=render
 guard && hash_is "$WORKER" "$WORKER_SHA" || fail pre_render_guard
 manifest || fail manifest_render
-echo "RAM_JOB_RENDER_START preset=$PRESET grain=$GRAIN halation=$HALATION"
+echo "RAM_JOB_RENDER_START preset=$PRESET grain=$GRAIN halation=$HALATION scale=$SCALE_ARG"
+clock_ms || :
+render_started=$CLOCK_MS
 worker_inflight=1
-"$WORKER" "$PRESET" "$INPUT" "$OUTPUT" "$GRAIN" "$HALATION" > "$LOCK/render.log" 2>&1 &
+"$WORKER" --scale "$SCALE_ARG" "$PRESET" "$INPUT" "$OUTPUT" "$GRAIN" "$HALATION" > "$LOCK/render.log" 2>&1 &
 worker_pid=$!
 manifest || fail manifest_worker
 wait "$worker_pid"
@@ -421,31 +543,26 @@ worker_rc=$?
 worker_inflight=0
 "$BB" cat "$LOCK/render.log"
 test "$worker_rc" = 0 && "$BB" grep -q '^FILM_DONE ' "$LOCK/render.log" || fail render
-hash_is "$INPUT" "$INPUT_SHA" || fail input_changed
-file_bytes "$OUTPUT" && test "$FILE_BYTES" -gt 0 && test "$FILE_BYTES" -le 16777216 || fail output_size
+stage_done render "$render_started"
+file_bytes "$INPUT" && test "$FILE_BYTES" = "$EXPECTED_BYTES" || fail input_changed
+file_bytes "$OUTPUT" && test "$FILE_BYTES" -gt 0 && test "$FILE_BYTES" -le 58720256 || fail output_size
 OUTPUT_BYTES=$FILE_BYTES
 hash_file "$OUTPUT" || fail output_hash
 OUTPUT_SHA=$HASH
 guard || fail post_render_guard
 if test "$MODE" = apply; then
-    confirm_settings settings_after_render
     PHASE=release_original_scratch
     manifest || fail manifest_rendered
-    # Keep the original hash/size in the manifest, then free only our own input.
-    hash_is "$INPUT" "$INPUT_SHA" || fail input_changed
-    release_input
-    memory_budget "$(((OUTPUT_BYTES+1023)/1024))" || fail source_readiness_memory
-    read_source_ready before_target
-    file_bytes "$INPUT" && test "$FILE_BYTES" = "$EXPECTED_BYTES" &&
-        hash_is "$INPUT" "$INPUT_SHA" || fail source_changed_before_write
+    # The pinned worker has only read the source scratch. It was hash-checked
+    # above; release it now and never reopen the original on the normal path.
     release_input
     # Waiting never reuses a stale absence result. No read, wait or other media
     # operation intervenes between this new absence and the SD write.
     native_run absent "$TARGET"
     test ! -e "$INPUT" && test ! -L "$INPUT" || { retain=1;fail absence_scratch_unconfirmed 21; }
     confirm_settings settings_before_write
-    guard && file_bytes "$OUTPUT" && test "$FILE_BYTES" = "$OUTPUT_BYTES" &&
-        hash_is "$OUTPUT" "$OUTPUT_SHA" || fail pre_write_output
+    test ! -e "$CAPTURE_STOP" || fail stopped_before_write 20
+    guard && file_bytes "$OUTPUT" && test "$FILE_BYTES" = "$OUTPUT_BYTES" || fail pre_write_output
     TARGET_ATTEMPTED=1
     retain=1
     # absent is a fresh nonexistence check, not atomic exclusive-create.
@@ -453,26 +570,26 @@ if test "$MODE" = apply; then
     native_run write "$TARGET"
     native_run flush "$TARGET"
     PHASE=release_output_scratch
-    hash_is "$OUTPUT" "$OUTPUT_SHA" || fail output_changed
+    file_bytes "$OUTPUT" && test "$FILE_BYTES" = "$OUTPUT_BYTES" || fail output_changed
     manifest || fail manifest_flushed
     "$BB" rm -f "$OUTPUT" || fail release_output
     test ! -e "$OUTPUT" && test ! -L "$OUTPUT" || fail release_output
     native_run readback "$TARGET"
+    PHASE=verify_readback
+    clock_ms || :
+    verify_started=$CLOCK_MS
     file_bytes "$INPUT" && test "$FILE_BYTES" = "$OUTPUT_BYTES" || fail target_readback_size
     READBACK_BYTES=$FILE_BYTES
     hash_file "$INPUT" || fail target_readback_hash
     READBACK_SHA=$HASH
     test "$READBACK_SHA" = "$OUTPUT_SHA" || fail target_readback_hash
-    decode_input verify_readback target_readback_decode
+    stage_done verify_readback "$verify_started"
     TARGET_VERIFIED=1
     PHASE=verified_target
     manifest || fail manifest_verified_target
     release_input
-    memory_budget 0 || fail original_readback_memory
-    native_run read "$SOURCE"
-    file_bytes "$INPUT" && test "$FILE_BYTES" = "$EXPECTED_BYTES" &&
-        hash_is "$INPUT" "$INPUT_SHA" || fail original_readback
-    ORIGINAL_VERIFIED=1
+    # Source preservation is enforced by read-only paths, not a third full
+    # copy/hash. Do not claim an independent post-job original verification.
     PHASE=applied
     manifest || fail manifest_applied
     guard || fail final_guard

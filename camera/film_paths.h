@@ -1,13 +1,16 @@
 #ifndef A6400_FILM_PATHS_H
 #define A6400_FILM_PATHS_H
-#ifdef A6400_FILM_JOB
+#include <string.h>
+#if defined(A6400_FILM_JOB) || defined(A7R4A_FILM_JOB)
 /* This build is for one manager-owned private RAM mount. Its fixed filenames
  * do not grant the legacy renderer access to nested paths or arbitrary SD I/O. */
 static int film_input_path(const char *p) {
-    return !strcmp(p,"/tmp_bt/a6400-film-job/input.jpg");
+    return !strcmp(p,"/tmp_bt/a6400-film-job/input.jpg") ||
+           !strcmp(p,"/tmp_bt/a7r4a-film-job/input.jpg");
 }
 static int film_output_path(const char *p) {
-    return !strcmp(p,"/tmp_bt/a6400-film-job/output.jpg");
+    return !strcmp(p,"/tmp_bt/a6400-film-job/output.jpg") ||
+           !strcmp(p,"/tmp_bt/a7r4a-film-job/output.jpg");
 }
 #else
 /* Keep the ARM worker in our scratch/test/output directories. */
@@ -27,6 +30,7 @@ static int film_input_path(const char *p) {
     if (!strncmp(p,"/tmp_bt/",8)) return film_components(p+8,0);
     if (!strncmp(p,"/mnt/DCIM/",10)) return film_components(p+10,1);
     if (!strncmp(p,"/mnt/A6400/TEST/",16)) return film_components(p+16,0);
+    if (!strncmp(p,"/mnt/A7R4A/TEST/",16)) return film_components(p+16,0);
     return 0;
 }
 static int film_output_path(const char *p) {

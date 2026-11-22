@@ -8,12 +8,20 @@ RAM=/tmp_bt
 MOUNT=/mnt
 MOUNTS=/proc/mounts
 UPTIME=/proc/uptime
-CAMERA_FDS=/proc/149/fd
+PROC_ROOT=/proc
 AELOCK=$RAM/ae.lock
 PREPARE=$MOUNT/A6400/RUNTIME/prepare.sh
 RUNTIME=$RAM/a6400-film-runtime-start.sh
 BOOTLOG=$RAM/a6400-film-boot.log
 mounted=0
+# On stock ILCE-7RM4A, /tmp_bt lives on read-only rootfs until tmpfs is mounted.
+if test -e /tmp/disable_hook; then
+    echo FILM_BOOT_DISABLED
+    exit 0
+fi
+if test -d "$RAM" && test ! -L "$RAM" && test ! -w "$RAM"; then
+    "$BB" mount -t tmpfs -o size=16m,mode=755,nosuid,nodev tmpfs "$RAM" || exit 1
+fi
 # Keep constructor output even if a pre-mount gate refuses startup. Never
 # overwrite an earlier invocation's evidence or follow an existing symlink.
 test ! -e "$BOOTLOG" && test ! -L "$BOOTLOG" || exit 1
@@ -43,25 +51,34 @@ early_boot() {
     test "${#seconds}" -le 3 && test "$seconds" -le 30 || {
         echo "FILM_BOOT_GATE reason=late_boot uptime=$uptime"; return 1;
     }
-    # The author's userspace FS owns mmca once open. Refuse to mount it then.
-    # Expand this fixed proc glob deliberately; all other shell globbing stays off.
-    if test -d "$CAMERA_FDS"; then
-        test -r "$CAMERA_FDS" && test -x "$CAMERA_FDS" || {
-            echo "FILM_BOOT_GATE reason=fd_directory_unreadable uptime=$uptime"; return 1;
-        }
-    fi
+    # The author's userspace FS owns mmc* once open. Refuse to mount it then.
+    # Expand only fixed proc globs deliberately; all other globbing stays off.
     set +f
-    set -- "$CAMERA_FDS"/*
+    set -- "$PROC_ROOT"/[0-9]*/comm
     set -f
-    for fd do
-        test -L "$fd" || continue
-        fd_target=$("$BB" readlink "$fd") || {
-            echo "FILM_BOOT_GATE reason=fd_readlink uptime=$uptime fd=$fd"; return 1;
-        }
-        case "$fd_target" in /dev/mmca*|/dev/mmcblk*)
-            echo "FILM_BOOT_GATE reason=camera_sd_handle uptime=$uptime fd=$fd target=$fd_target"
-            return 1;;
-        esac
+    for comm_path do
+        test -r "$comm_path" || continue
+        IFS= read -r proc_comm < "$comm_path" 2>/dev/null || continue
+        test "$proc_comm" = im.elf || continue
+        camera_fds=${comm_path%/comm}/fd
+        if test -d "$camera_fds"; then
+            test -r "$camera_fds" && test -x "$camera_fds" || {
+                echo "FILM_BOOT_GATE reason=fd_directory_unreadable uptime=$uptime"; return 1;
+            }
+        fi
+        set +f
+        set -- "$camera_fds"/*
+        set -f
+        for fd do
+            test -L "$fd" || continue
+            fd_target=$("$BB" readlink "$fd") || {
+                echo "FILM_BOOT_GATE reason=fd_readlink uptime=$uptime fd=$fd"; return 1;
+            }
+            case "$fd_target" in /dev/mmc*)
+                echo "FILM_BOOT_GATE reason=camera_sd_handle uptime=$uptime fd=$fd target=$fd_target"
+                return 1;;
+            esac
+        done
     done
     echo "FILM_BOOT_GATE result=early_exclusive uptime=$uptime"
     return 0
@@ -70,7 +87,7 @@ clear_mounts() {
     test -r "$MOUNTS" || return 1
     while read -r source target type options rest; do
         test "$target" != "$MOUNT" || return 1
-        case "$source" in /dev/mmca*|/dev/mmcblk*) return 1;; esac
+        case "$source" in /dev/mmc*) return 1;; esac
     done < "$MOUNTS"
     return 0
 }

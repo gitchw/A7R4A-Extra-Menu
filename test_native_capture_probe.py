@@ -8,7 +8,11 @@ import tempfile
 import threading
 import time
 import unittest
-from synthetic_native_frames import SYNTHETIC_ROOT_VERSION, SYNTHETIC_FNEXT_UNMOUNTED
+from synthetic_native_frames import (
+    SYNTHETIC_FNEXT_UNMOUNTED,
+    SYNTHETIC_INTERLEAVED_FNEXT_METADATA,
+    SYNTHETIC_ROOT_VERSION,
+)
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = ROOT/'camera/native_capture_probe.c'
@@ -41,6 +45,27 @@ for command in sys.stdin:
  args=command.strip().split();verb=args[2]
  header='MprFileIf : '+('FFirst [pathname]' if verb=='FFirst' else "FNext ['c' to cancel]")
  if verb=='FFirst':directory=args[3]
+ metadata_count=root/'metadata-fault-count'
+ count=int(metadata_count.read_text()) if metadata_count.exists() else 0
+ if count and (root/'metadata-next-fault').exists():
+  next_fault=(root/'metadata-next-fault').read_text()
+  print(header)
+  if next_fault=='native_error':print('ec = 0x00001005\nMON>',flush=True)
+  elif next_fault=='overflow':print('OVERFLOW',flush=True)
+  elif next_fault=='unknown_callback':print('[MprIf] Callback Unknown\nFindFirst OK.\nMON>',flush=True)
+  elif next_fault=='no_prompt':print('10061115\nkind : DIR\nfile length = 0\nmodification time = 1 : 2 : 3\nFindFirst OK.',flush=True)
+  continue
+ mode=root/'metadata-fault-mode'
+ if mode.exists() and (not count or mode.read_text()=='always') and verb=='FNext' and directory!='ms:/DCIM/*' and index+1<len(items):
+  target=root/'metadata-fault-target'
+  if not target.exists() or items[index+1][0]==target.read_text():
+   index+=1
+   time.sleep(float((root/'metadata-fault-delay').read_text()) if (root/'metadata-fault-delay').exists() else 0)
+   metadata_count.write_text(str(count+1))
+   commands=root/'scan-commands'
+   if commands.exists():
+    with commands.open('a') as log:log.write('METADATA_FAULT\n')
+   sys.stdout.buffer.write((root/'metadata-reply').read_bytes());sys.stdout.buffer.flush();continue
  if (root/'recorded-unmounted').exists():
   with (root/'unmount-commands').open('a') as log:log.write(command)
   flag=root/'midscan-unmounted'
@@ -54,6 +79,11 @@ for command in sys.stdin:
     data=data.replace(b"FNext ['c' to cancel]",b'FFirst [pathname]').replace(b'(696) FindNext()',b'(588) FindFirst()')
    sys.stdout.buffer.write(data);sys.stdout.buffer.flush();continue
  if fault=='restart_partial_overflow' and stream_number==2:print('FLOW')
+ recorded_used=root/'recorded-getstill-used'
+ if fault=='getstill_recorded' and verb=='FNext' and directory!='ms:/DCIM/*' and index<len(items) and not recorded_used.exists():
+  index+=1
+  recorded_used.write_text('1')
+  sys.stdout.buffer.write((root/'recorded-getstill').read_bytes());sys.stdout.buffer.flush();continue
  if fault=='retry_recorded' and verb=='FFirst' and args[3]=='ms:/DCIM/*':
   items=[('10061115',True,0)];index=0
   sys.stdout.buffer.write((root/'recorded-retry').read_bytes());sys.stdout.buffer.flush();continue
@@ -82,6 +112,20 @@ for command in sys.stdin:
   print(header[11:])
  else:
   print(header)
+ if fault=='getstill_live' and verb=='FNext' and directory!='ms:/DCIM/*' and index+1<len(items) and not (root/'getstill-live-used').exists():
+  (root/'getstill-live-used').write_text('1')
+  print('[MprIf] Callback GetStillAttrInfo')
+ if fault=='cache_playback_live' and verb=='FNext' and directory!='ms:/DCIM/*' and index+1<len(items) and not (root/'cache-playback-live-used').exists():
+  (root/'cache-playback-live-used').write_text('1')
+  print('[CACHE]BUFFER SIZE TOO SMALL : 00000000\n[CACHE]ERROR(C1000002h)\n[MprIf] Callback EnterStillPb')
+ if fault=='nul_metadata' and verb=='FFirst' and args[3]=='ms:/DCIM/*' and (not (root/'nul-metadata-used').exists() or (root/'nul-metadata-always').exists()):
+  if not (root/'nul-metadata-always').exists():(root/'nul-metadata-used').write_text('1')
+  corrupted=('10061115\nkind           : FILE\n'
+             'hidden  CACHE]ERROR(C1000010h)\n').encode()+b'\0          : false \n'
+  corrupted+=(b'file length = 21\nmodification time = 15 : 36 : 16\n'
+              b'FindFirst OK.\n\nMON>')
+  sys.stdout.flush()
+  sys.stdout.buffer.write(corrupted);sys.stdout.buffer.flush();continue
  if fault=='body_noise_lost_tail':print('[native] unexpected\x1b[31m line before filename')
  if fault=='body_noise_large':print('unexpected native diagnostic '+('x'*2500))
  version='[MSL][0x1A2BDCD0]: MSLF_WD_Version = 0104'
@@ -89,7 +133,7 @@ for command in sys.stdin:
  if fault.startswith('wd_'):
   if root_first:
    if fault=='wd_version_duplicate':print(version+'\n'+version)
-   elif fault=='wd_version_unknown':print(version.replace('0104','0105'))
+   elif fault=='wd_version_unknown':print(version.replace('0104','010G'))
    elif fault=='wd_version_bad_address':print(version.replace('1A2BDCD0','1A2BDCG0'))
    elif fault=='wd_version_suffix':print(version+' extra')
    elif fault=='wd_version_error':print(version+'\nec = 0x00001005')
@@ -233,6 +277,8 @@ class CaptureProbeTests(unittest.TestCase):
                         str(SOURCE),'-o',str(self.binary)],check=True,capture_output=True)
 
     def run_probe(self,mode='scan',fault='',events=()):
+        for marker in ('recorded-getstill-used','getstill-live-used','cache-playback-live-used'):
+            (self.base/marker).unlink(missing_ok=True)
         env=dict(os.environ,CAPTURE_FIXTURE=str(self.base),CAPTURE_FAULT=fault)
         p=subprocess.Popen([str(self.binary),mode],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,text=True)
         lines=[];baseline=threading.Event();cancel=threading.Event()
@@ -261,6 +307,17 @@ class CaptureProbeTests(unittest.TestCase):
         rc,out=self.run_probe();self.assertEqual(rc,0,out)
         self.assertIn('ms:/DCIM/10061115/A6400001.JPG',out)
         self.assertNotIn('CAPTURE_CANDIDATE',out)
+
+    def test_byte_interleaved_metadata_is_never_accepted_as_entry(self):
+        data=SYNTHETIC_INTERLEAVED_FNEXT_METADATA
+        (self.base/'metadata-reply').write_bytes(data)
+        (self.base/'metadata-fault-mode').write_text('once')
+        (self.dcim/'A6400002.JPG').write_bytes(b'another old photo')
+        rc,out=self.run_probe()
+        self.assertNotEqual(rc,0,out)
+        self.assertEqual(self.diagnostic(out,'MPR FileIf FNext','4')['reason'],
+                         'incomplete_metadata',out)
+        self.assertNotIn('CAPTURE_BASELINE ',out)
 
     def test_matching_ffirst_retry_before_entry_keeps_complete_metadata(self):
         rc,out=self.run_probe(fault='retry_success')
@@ -618,6 +675,90 @@ done:
                 self.assertNotIn('baseline_media_unavailable',out)
                 self.assertNotIn('CAPTURE_BASELINE ',out)
 
+    def getstill_reply(self):
+        data=(b"MprFileIf : FNext ['c' to cancel]\r\n"
+              b"[MprIf] Callback GetStillAttrInfo\r\n"
+              b"A6409684.JPG\r\nkind           : FILE \r\n"
+              b"file length = 14\r\nmodification time = 10 : 15 : 56\r\n"
+              b"FindNext OK.\r\n\r\nMON>")
+        (self.dcim/'A6409684.JPG').write_bytes(b'second baseline')
+        return data
+
+    def test_recorded_getstill_callback_keeps_complete_fnext_entry(self):
+        (self.base/'recorded-getstill').write_bytes(self.getstill_reply())
+        rc,out=self.run_probe(fault='getstill_recorded')
+        self.assertEqual(rc,0,out)
+        self.assertIn('CAPTURE_BASELINE count=2',out)
+        self.assertNotIn('CAPTURE_DIAG ',out)
+
+    def test_getstill_callback_does_not_hide_unknown_mixed_or_incomplete_reply(self):
+        data=self.getstill_reply()
+        callback=b'[MprIf] Callback GetStillAttrInfo\r\n'
+        variants={
+            'unknown':data.replace(callback,b'[MprIf] Callback Unknown\n'),
+            'suffix':data.replace(callback,callback.rstrip()+b' extra\n'),
+            'duplicate':data.replace(callback,callback+callback),
+            'after_name':data.replace(callback,b'').replace(b'A6409684.JPG\r\n',b'A6409684.JPG\r\n'+callback),
+            'mixed_error':data.replace(b'FindNext OK.',b'FindNext OK.\nec = 0x00001005'),
+            'missing_success':data.replace(b'FindNext OK.',b''),
+            'missing_kind':data.replace(b'kind           : FILE \r\n',b''),
+            'extra_unknown':data.replace(callback,callback+b'unrecognized native line\n'),
+            'end_instead_of_entry':data.split(callback)[0]+callback+b'No more Files.\r\nec = 0x00001008\r\nMON>',
+        }
+        for kind,reply in variants.items():
+            with self.subTest(kind=kind):
+                (self.base/'recorded-getstill').write_bytes(reply)
+                rc,out=self.run_probe(fault='getstill_recorded')
+                self.assertNotEqual(rc,0,out)
+                self.assertNotIn('CAPTURE_BASELINE ',out)
+
+    def cache_playback_reply(self):
+        data=(b"MprFileIf : FNext ['c' to cancel]\r\n"
+              b"[CACHE]BUFFER SIZE TOO SMALL : 00000000\r\n"
+              b"[CACHE]ERROR(C1000002h)\r\n"
+              b"[MprIf] Callback EnterStillPb\r\n"
+              b"A6409682.JPG\r\nkind           : FILE \r\n"
+              b"file length = 14\r\nmodification time = 10 : 15 : 56\r\n"
+              b"FindNext OK.\r\n\r\nMON>")
+        (self.dcim/'A6409682.JPG').write_bytes(b'second baseline')
+        return data
+
+    def test_recorded_cache_playback_notice_keeps_complete_fnext_entry(self):
+        (self.base/'recorded-getstill').write_bytes(self.cache_playback_reply())
+        rc,out=self.run_probe(fault='getstill_recorded')
+        self.assertEqual(rc,0,out)
+        self.assertIn('CAPTURE_BASELINE count=2',out)
+        self.assertNotIn('CAPTURE_DIAG ',out)
+
+    def test_cache_playback_notice_requires_exact_complete_ordered_group_and_success(self):
+        data=self.cache_playback_reply()
+        buffer=b'[CACHE]BUFFER SIZE TOO SMALL : 00000000\r\n'
+        error=b'[CACHE]ERROR(C1000002h)\r\n'
+        callback=b'[MprIf] Callback EnterStillPb\r\n'
+        group=buffer+error+callback
+        variants={
+            'error_alone':data.replace(buffer,b'').replace(callback,b''),
+            'missing_callback':data.replace(callback,b''),
+            'missing_error':data.replace(error,b''),
+            'wrong_error':data.replace(b'C1000002h',b'C1000003h'),
+            'duplicate_group':data.replace(group,group+group),
+            'wrong_order':data.replace(group,error+buffer+callback),
+            'after_name':data.replace(group,b'').replace(b'A6409682.JPG\r\n',b'A6409682.JPG\r\n'+group),
+            'mixed_native_error':data.replace(b'FindNext OK.',b'FindNext OK.\nec = 0x00001005'),
+            'missing_metadata':data.replace(b'kind           : FILE \r\n',b''),
+            'missing_success':data.replace(b'FindNext OK.',b''),
+            'unknown_suffix':data.replace(callback,callback.rstrip()+b' unknown\n'),
+            'interrupted_group':data.replace(error,b'unknown notice\n'+error),
+            'mixed_getstill':data.replace(group,b'[MprIf] Callback GetStillAttrInfo\n'+group),
+            'end_instead_of_entry':data.split(group)[0]+group+b'No more Files.\r\nec = 0x00001008\r\nMON>',
+        }
+        for kind,reply in variants.items():
+            with self.subTest(kind=kind):
+                (self.base/'recorded-getstill').write_bytes(reply)
+                rc,out=self.run_probe(fault='getstill_recorded')
+                self.assertNotEqual(rc,0,out)
+                self.assertNotIn('CAPTURE_BASELINE ',out)
+
     def unmounted_inventory_harness(self):
         harness=self.base/'inventory.c'
         harness.write_text('#define main scanner_main\n#include "'+str(SOURCE)+'"\n#undef main\n'+r'''
@@ -808,5 +949,77 @@ int main(void) {
         self.assertIn('stale_stop',out)
         self.assertFalse((self.base/'monitor.pid').exists())
         self.assertEqual((self.base/'stop').read_text(),'previous run')
+
+    def test_a7r4a_four_hex_wd_version_and_ms2_unmounted_variants(self):
+        (self.base/'recorded-version').write_bytes(SYNTHETIC_ROOT_VERSION.replace(b'0104',b'0105'))
+        rc,out=self.run_probe(fault='wd_version_recorded')
+        self.assertEqual(rc,0,out)
+        self.assertIn('CAPTURE_BASELINE count=1 ',out)
+
+        ms2_unmounted=(SYNTHETIC_FNEXT_UNMOUNTED
+            .replace(b'[AVIMMGR][MS1]',b'[AVIMMGR][MS2]')
+            .replace(b'AviMMgrFileIf.cpp(696)',b'AviMMgrFileIf.cpp(712)')
+            .replace(b'AviMMgrCmd.cpp(16755)',b'AviMMgrCmd.cpp(17001)')
+            .replace(b"FNext ['c' to cancel]",b'FFirst [pathname]')
+            .replace(b'FindNext()',b'FindFirst()'))
+        (self.base/'recorded-unmounted').write_bytes(ms2_unmounted)
+        # Re-use recorded-version slot to emit ms2_unmounted on root FFirst
+        (self.base/'recorded-version').write_bytes(ms2_unmounted)
+        rc,out=self.run_probe(fault='wd_version_recorded')
+        self.assertNotEqual(rc,0,out)
+        self.assertEqual(self.diagnostic(out)['reason'],'baseline_media_unavailable',out)
+
+        slotb_monitor=self.base/'monitor-slotb'
+        slotb_monitor.write_text(MONITOR.replace("args[3][4:]","args[3][len('/SlotB:'):]").replace("ms:/DCIM","/SlotB:/DCIM"))
+        slotb_monitor.chmod(0o700)
+        slotb_header=self.base/'slotb_hdr'
+        slotb_header.mkdir()
+        (slotb_header/'capture_probe_build.h').write_text(
+            f'#define CAPTURE_MONITOR "{slotb_monitor}"\n'
+            f'#define CAPTURE_LOCK "{self.base}/slotb.lock"\n'
+            f'#define CAPTURE_STOP_FILE "{self.base}/slotb.stop"\n'
+            f'#define CAPTURE_MONITOR_BYTES {slotb_monitor.stat().st_size}u\n'
+            f'#define CAPTURE_MONITOR_FNV 0x{fnv(slotb_monitor.read_bytes()):08x}u\n'
+            '#define CAPTURE_MPR_ROOT "/SlotB:/DCIM"\n')
+        slotb_bin=self.base/'capture-slotb'
+        subprocess.run(['cc','-std=c11','-O2','-Wall','-Wextra','-Werror','-I',str(slotb_header),
+                        str(SOURCE),'-o',str(slotb_bin)],check=True,capture_output=True)
+        r=subprocess.run([str(slotb_bin),'scan'],capture_output=True,text=True,
+                         env=dict(os.environ,CAPTURE_FIXTURE=str(self.base)))
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertIn('/SlotB:/DCIM/10061115/A6400001.JPG',r.stdout)
+
+    def test_live_a7r4a_checkmsid_split_unmounted_and_negative(self):
+        seq180_ms1=(b"MprFileIf : FFirst [pathname]\n"
+                    b"[MMGR][AVI] ## ERROR(MMGR/FileIf):0x0EF10001 ## avimmgr/AviMMgrFileIf.cpp(588) FindFirst()\n"
+                    b"[AVIMMGR][MS1]GetDeviceInfo : ER_SEQUENCE  DEVICE Unmounted\n"
+                    b"[MMGR][AVI] ## ERROR(MMGR):0x31000007 ## avimmgr/AviMMgrCmd.cpp(16637)[AVIMMGR][MS1]CheckMSId : MS IDs are same. \n"
+                    b" GetDeviceInfo()\n"
+                    b"ec = 0x0000100B\n\nMON>")
+        for payload in (seq180_ms1, seq180_ms1.replace(b'[AVIMMGR][MS1]', b'[AVIMMGR][MS2]')):
+            (self.base/'recorded-version').write_bytes(payload)
+            rc,out=self.run_probe(fault='wd_version_recorded')
+            self.assertNotEqual(rc,0,out)
+            self.assertEqual(self.diagnostic(out)['reason'],'baseline_media_unavailable',out)
+        missing_getdev=seq180_ms1.replace(b" GetDeviceInfo()\n", b"")
+        (self.base/'recorded-version').write_bytes(missing_getdev)
+        rc,out=self.run_probe(fault='wd_version_recorded')
+        self.assertNotEqual(rc,0,out)
+        self.assertEqual(self.diagnostic(out)['reason'],'native_status',out)
+
+    def test_large_non_jpeg_and_dotfiles_ignored(self):
+        with (self.base/'DCIM/14961119.zip').open('wb') as f:
+            f.truncate(4052019817)
+        with (self.dcim/'A6400002.ARW').open('wb') as f:
+            f.truncate(128000000)
+        (self.base/'DCIM/.DS_Store').write_bytes(b'mac')
+        (self.dcim/'._A64001.JPG').write_bytes(b'appledouble')
+        rc,out=self.run_probe()
+        self.assertEqual(rc,0,out)
+        self.assertIn('CAPTURE_EXISTING path=ms:/DCIM/10061115/A6400001.JPG',out)
+        self.assertNotIn('14961119.zip',out)
+        self.assertNotIn('.ARW',out)
+        self.assertNotIn('.DS_Store',out)
+        self.assertNotIn('._A64001.JPG',out)
 
 if __name__=='__main__':unittest.main()

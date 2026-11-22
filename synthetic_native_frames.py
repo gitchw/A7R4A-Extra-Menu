@@ -16,3 +16,9 @@ SYNTHETIC_FNEXT_UNMOUNTED = (
     b"avimmgr/AviMMgrCmd.cpp(16755) GetDeviceInfo()\r\n"
     b"ec = 0x0000100B\r\n\r\nMON>"
 )
+
+SYNTHETIC_INTERLEAVED_FNEXT_METADATA = (
+    b"MprFileIf : FNext ['c' to cancel]\r\n"
+    b"A6400002.JPG\r\nkind : FILE\r\nfile length = 14\r\n"
+    b"FindNext OK.\r\n\r\nMON>"
+)

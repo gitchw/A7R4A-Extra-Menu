@@ -13,10 +13,10 @@ ROOT=Path(__file__).resolve().parent
 BUILDER=ROOT/'host-tests/build_film_runtime_package.py'
 DESTS={
  'ui':'a6400-film-ui-v3-persist.so','menu_job':'a6400-film-menu-job.elf',
- 'worker':'a6400-film-job.elf','native':'a6400-film-native-command.elf',
+ 'worker':'a7r4a-film-job.elf','native':'a6400-film-native-command.elf',
  'ram_job':'a6400-film-ram-job.sh','capture_daemon':'a6400-film-capture-daemon.elf',
- 'guard':'a6400-ui-load-guard.elf','check':'a6400-check-persist.req',
- 'install':'a6400-install-persist.req','remove':'a6400-remove-persist.req'}
+ 'guard':'a7r4a-ui-load-guard.elf','check':'a7r4a-check.req',
+ 'install':'a7r4a-install.req','remove':'a7r4a-remove.req'}
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 
 BB=r'''#!/usr/bin/env python3
@@ -37,7 +37,7 @@ if cmd=='sha256sum':
 os.execvp(cmd,[cmd]+args)
 '''
 GUARD=r'''#!/bin/sh
-op=$(cat "$FILM_PACKAGE_FIXTURE/ram/a6400-ui-load.req")
+op=$(cat "$FILM_PACKAGE_FIXTURE/ram/a7r4a-ui-load.req")
 echo "guard $op" >> "$FILM_PACKAGE_FIXTURE/events"
 case "$op" in check) n=0;; install) n=1;; *) exit 3;; esac
 if [ "${BAD_GUARD:-}" = "$op" ]; then echo "END result=9 op=$n errno=0"; exit 0; fi
@@ -253,7 +253,7 @@ class FilmRuntimePackageTests(unittest.TestCase):
   self.assertEqual(log.read_bytes(),b'retained diagnostic evidence\n')
   self.assertFalse((self.base/'events').exists())
   self.assertFalse((self.ram/'a6400-film-runtime.lock').exists())
-  self.assertFalse((self.ram/'a6400-ui-load.req').exists())
+  self.assertFalse((self.ram/'a7r4a-ui-load.req').exists())
 
  def test_runtime_preserves_runtime_log_symlink_before_any_guard_action(self):
   self.stage_fixture();self.assertEqual(self.run_script(self.prepare).returncode,0)
@@ -268,7 +268,7 @@ class FilmRuntimePackageTests(unittest.TestCase):
   self.assertEqual(target.read_bytes(),b'original target evidence\n')
   self.assertFalse((self.base/'events').exists())
   self.assertFalse((self.ram/'a6400-film-runtime.lock').exists())
-  self.assertFalse((self.ram/'a6400-ui-load.req').exists())
+  self.assertFalse((self.ram/'a7r4a-ui-load.req').exists())
 
  def test_runtime_preserves_dangling_runtime_log_symlink_before_any_guard_action(self):
   self.stage_fixture();self.assertEqual(self.run_script(self.prepare).returncode,0)
@@ -283,7 +283,7 @@ class FilmRuntimePackageTests(unittest.TestCase):
   self.assertFalse(target.exists())
   self.assertFalse((self.base/'events').exists())
   self.assertFalse((self.ram/'a6400-film-runtime.lock').exists())
-  self.assertFalse((self.ram/'a6400-ui-load.req').exists())
+  self.assertFalse((self.ram/'a7r4a-ui-load.req').exists())
 
  def test_runtime_stop_marker_is_preserved_and_prevents_startup(self):
   self.stage_fixture();self.assertEqual(self.run_script(self.prepare).returncode,0)
@@ -362,5 +362,70 @@ class FilmRuntimePackageTests(unittest.TestCase):
   self.stage_fixture();(self.base/'disable_hook').touch()
   r=self.run_script(self.bootstrap);self.assertEqual(r.returncode,0,r.stdout+r.stderr)
   self.assertFalse((self.base/'events').exists())
+
+ def test_slot2_mmcb_mount_and_dynamic_pid_162_are_supported(self):
+  self.stage_fixture()
+  shutil.move(self.base/'proc/149',self.base/'proc/162')
+  r=self.run_script(self.bootstrap)
+  self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+  self.assertEqual((self.base/'events').read_text().splitlines(),
+                   ['mount','umount','guard check','guard install','daemon watch'])
+
+  # Slot 2 (/dev/mmcb1) mounted in /proc/mounts must block runtime and bootstrap
+  (self.base/'proc/mounts').write_text('/dev/mmcb1 /mnt/sd2 vfat rw 0 0\n')
+  r=self.run_script(self.ram/'a6400-film-runtime-start.sh')
+  self.assertNotEqual(r.returncode,0)
+  self.assertIn('linux_sd_mounted',r.stdout)
+
+  # Slot 2 fd (/dev/mmcb1) under PID 162 must block early_boot
+  (self.base/'proc/mounts').write_text('')
+  (self.ram/'a6400-film-boot.log').unlink()
+  (self.base/'proc/162/fd/68').symlink_to('/dev/mmcb1')
+  r=self.run_script(self.bootstrap)
+  self.assertNotEqual(r.returncode,0)
+  self.assertIn('target=/dev/mmcb1',(self.ram/'a6400-film-boot.log').read_text())
+
+ def test_bootstrap_mounts_tmpfs_when_ram_dir_is_read_only(self):
+  self.stage_fixture()
+  self.bb.write_text('''#!/usr/bin/env python3
+import hashlib,os,sys
+from pathlib import Path
+b=Path(os.environ['FILM_PACKAGE_FIXTURE']);cmd=sys.argv[1];args=sys.argv[2:]
+if cmd=='mount' and 'tmpfs' in args:
+ os.chmod(b/'ram',0o755)
+ with (b/'events').open('a') as f:f.write('mount tmpfs\\n')
+ sys.exit(0)
+if cmd in ('mount','umount'):
+ with (b/'events').open('a') as f:f.write(cmd+'\\n')
+ if cmd=='mount':
+  (b/'proc/mounts').write_text('/dev/mmca1 '+str(b/'mnt')+' vfat ro 0 0\\n')
+  sys.exit(0)
+ (b/'proc/mounts').write_text('');sys.exit(0)
+if cmd=='sleep':sys.exit(0)
+if cmd=='sha256sum':
+ p=Path(args[0]);print(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+str(p));sys.exit(0)
+os.execvp(cmd,[cmd]+args)
+''')
+  self.bb.chmod(0o700)
+  self.ram.chmod(0o555)
+  self.addCleanup(lambda: self.ram.chmod(0o755) if self.ram.exists() else None)
+  r=self.run_script(self.bootstrap)
+  self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+  self.assertEqual((self.base/'events').read_text().splitlines(),
+                   ['mount tmpfs','mount','umount','guard check','guard install','daemon watch'])
+
+ def test_stale_ram_job_settings_sha_is_rejected(self):
+  ram=self.src/DESTS['ram_job']
+  ram.write_text('#!/bin/sh\nNATIVE_SHA='+sha(self.src/DESTS['native'])+'\nWORKER_SHA='+sha(self.src/DESTS['worker'])+'\nSETTINGS_SHA='+'0'*64+'\n')
+  for row in self.config['artifacts']:
+   if row['role']=='ram_job':row['sha256']=sha(ram)
+  cp=json.loads(self.capture_pins.read_text())
+  data=ram.read_bytes();h=2166136261
+  for n in data:h=((h^n)*16777619)&0xffffffff
+  cp['script']={'runtime':'/tmp_bt/'+DESTS['ram_job'],'bytes':len(data),'fnv':f'{h:08x}','sha256':sha(ram)}
+  self.capture_pins.write_text(json.dumps(cp))
+  r=self.build()
+  self.assertNotEqual(r.returncode,0)
+  self.assertIn('RAM job SETTINGS_SHA mismatch',r.stderr+r.stdout)
 
 if __name__=='__main__':unittest.main(verbosity=2)

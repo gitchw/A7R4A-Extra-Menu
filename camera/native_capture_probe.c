@@ -19,10 +19,20 @@
 #include <unistd.h>
 #ifndef CAPTURE_STARTUP_MS
 #define CAPTURE_STARTUP_MS 1000u
+#endif
+#ifndef CAPTURE_COMMAND_MS
 #define CAPTURE_COMMAND_MS 4000u
+#endif
+#ifndef CAPTURE_WAIT_MS
 #define CAPTURE_WAIT_MS 25000u
+#endif
+#ifndef CAPTURE_ACTIVE_MS
 #define CAPTURE_ACTIVE_MS 600000u
+#endif
+#ifndef CAPTURE_INTERVAL_MS
 #define CAPTURE_INTERVAL_MS 3000u
+#endif
+#ifndef CAPTURE_STABLE_MS
 #define CAPTURE_STABLE_MS 3000u
 #endif
 #ifndef CAPTURE_QUIET_MS
@@ -31,20 +41,29 @@
 #ifndef CAPTURE_STARTUP_MAX_MS
 #define CAPTURE_STARTUP_MAX_MS 3000u
 #endif
+#ifndef CAPTURE_MPR_ROOT
+#define CAPTURE_MPR_ROOT "ms:/DCIM"
+#endif
+#ifndef MAX_FILES
 #define MAX_FILES 128u
+#endif
+#ifndef MAX_DIRS
 #define MAX_DIRS 8u
+#endif
 #define RESPONSE_BYTES 8192u
+#ifndef SCAN_MS
 #define SCAN_MS 15000u
+#endif
 #define PREAMBLE_BYTES 131072u
 #define FRAME_LINE_BYTES 256u
-struct entry { char path[80],time[32]; unsigned size; };
-struct item { char name[40],time[32]; unsigned size; int directory; };
+struct entry { char path[80],time[32]; uint64_t size; };
+struct item { char name[64],time[32]; uint64_t size; int directory; };
 struct catalogue { unsigned count; struct entry items[MAX_FILES]; };
 struct seen { struct entry value; uint32_t stable; int reported,present; };
 struct transport {
     pid_t pid; int in,out; uint32_t scan_started,command_started;
     unsigned command_seq,response_bytes,tail_bytes,preamble_bytes,body_bytes,overflow_match;
-    int header_seen,prompt_after_header,echo_seen;
+    int header_seen,prompt_after_header,echo_seen,metadata_retryable;
     char command[128],expected[40]; unsigned char tail[384];
     unsigned body_prefix_bytes;unsigned char body_prefix[768];
 };
@@ -141,8 +160,8 @@ static void transport_stop(struct transport *t) {
         kill(t->pid,SIGTERM);
         uint32_t start=now_ms();int status;
         while(waitpid(t->pid,&status,WNOHANG)==0) {
-            if((uint32_t)(now_ms()-start)>500u) {kill(t->pid,SIGKILL);break;}
-            pause_ms(10);
+            if((uint32_t)(now_ms()-start)>80u) {kill(t->pid,SIGKILL);break;}
+            pause_ms(5);
         }
         while(waitpid(t->pid,&status,0)<0 && errno==EINTR){}
     }
@@ -198,6 +217,10 @@ static int exact_echo(const char *line,unsigned size,const char *command) {
 }
 static int exchange_complete(struct transport *t,char *out,unsigned used,unsigned prompt_start) {
     t->prompt_after_header=1;response_context(t,out,used);
+    if(memchr(out,'\0',prompt_start)) {
+        t->metadata_retryable=1;
+        return exchange_failure(t,"nul_byte",0,out,used);
+    }
     out[prompt_start]=0;
     if(t->command_seq==1u || t->preamble_bytes)
         printf("CAPTURE_FRAME command_seq=%u response_bytes=%u preamble_bytes=%u body_bytes=%u echo_seen=%d\n",
@@ -216,7 +239,7 @@ static int exchange(struct transport *t,const char *command,const char *header,
     unsigned used=0;uint32_t start=now_ms();out[0]=0;
     t->command_started=start;++t->command_seq;
     t->response_bytes=t->tail_bytes=t->preamble_bytes=t->body_bytes=0;
-    t->header_seen=t->prompt_after_header=t->echo_seen=0;
+    t->header_seen=t->prompt_after_header=t->echo_seen=t->metadata_retryable=0;
     snprintf(t->command,sizeof(t->command),"%s",command);
     snprintf(t->expected,sizeof(t->expected),"%s",header);
     size_t length=strlen(command);ssize_t sent=write(t->in,command,length);
@@ -279,18 +302,19 @@ static int exchange(struct transport *t,const char *command,const char *header,
              ((uint32_t)(now_ms()-t->scan_started)>=SCAN_MS?"scan_timeout":"command_timeout"),0,out,used);
 }
 static int component(const char *s) {
-    size_t n=strlen(s);if(!n || n>32 || s[0]=='.')return 0;
+    size_t n=strlen(s);if(!n || n>=64u || !strcmp(s,".") || !strcmp(s,".."))return 0;
     for(size_t i=0;i<n;++i)
         if(!((s[i]>='A'&&s[i]<='Z')||(s[i]>='a'&&s[i]<='z')||
              (s[i]>='0'&&s[i]<='9')||s[i]=='_'||s[i]=='-'||s[i]=='.'))return 0;
     return 1;
 }
-static int number(const char *s,unsigned *out) {
-    unsigned v=0,n=0;
+static int number(const char *s,uint64_t *out) {
+    uint64_t v=0;unsigned n=0;
     while(*s==' ')++s;
     while(*s>='0'&&*s<='9') {
-        if(v>6710886u || (v==6710886u && *s>'4'))return -1;
-        v=v*10u+(unsigned)(*s++-'0');++n;
+        uint64_t d=(uint64_t)(*s++-'0');
+        if(v>(UINT64_MAX-d)/10u)return -1;
+        v=v*10u+d;++n;
     }
     while(*s==' ')++s;
     if(!n || *s)return -1;
@@ -305,19 +329,76 @@ static int line_equals(const char *line,size_t bytes,const char *value) {
     return strlen(value)==bytes && !memcmp(line,value,bytes);
 }
 static int wd_version_line(const char *line,size_t bytes) {
-    static const char prefix[]="[MSL][0x",suffix[]="]: MSLF_WD_Version = 0104";
-    const size_t begin=sizeof(prefix)-1u,end=sizeof(suffix)-1u;
-    if(bytes!=begin+8u+end || memcmp(line,prefix,begin) ||
-       memcmp(line+begin+8u,suffix,end))return 0;
+    static const char prefix[]="[MSL][0x",mid[]="]: MSLF_WD_Version = ";
+    const size_t begin=sizeof(prefix)-1u,midlen=sizeof(mid)-1u;
+    if(bytes!=begin+8u+midlen+4u || memcmp(line,prefix,begin) ||
+       memcmp(line+begin+8u,mid,midlen))return 0;
     for(size_t i=begin;i<begin+8u;++i)
         if(!isxdigit((unsigned char)line[i]))return 0;
+    for(size_t i=begin+8u+midlen;i<bytes;++i)
+        if(!isxdigit((unsigned char)line[i]))return 0;
     return 1;
+}
+static int valid_mpr_root(const char *directory) {
+    return !strcmp(directory,"ms:/DCIM") || !strcmp(directory,"ms1:/DCIM") ||
+           !strcmp(directory,"/SlotA:/DCIM") || !strcmp(directory,"/SlotB:/DCIM");
+}
+static int valid_mpr_scope(const char *directory) {
+    size_t rlen=strlen(CAPTURE_MPR_ROOT);
+    return valid_mpr_root(directory) ||
+           (!strncmp(directory,CAPTURE_MPR_ROOT,rlen) && directory[rlen]=='/');
+}
+static int digits_span(const char *s,size_t max_bytes,size_t *consumed) {
+    size_t n=0;
+    while(n<max_bytes && s[n]>='0' && s[n]<='9')++n;
+    if(!n || n>6u)return 0;
+    *consumed=n;
+    return 1;
+}
+static int unmounted_ms_line(const char *line,size_t bytes) {
+    return line_equals(line,bytes,"[AVIMMGR][MS1]GetDeviceInfo : ER_SEQUENCE  DEVICE Unmounted") ||
+           line_equals(line,bytes,"[AVIMMGR][MS2]GetDeviceInfo : ER_SEQUENCE  DEVICE Unmounted");
+}
+static int unmounted_fileif_line(const char *line,size_t bytes,int first) {
+    static const char prefix[]="[MMGR][AVI] ## ERROR(MMGR/FileIf):0x0EF10001 ## avimmgr/AviMMgrFileIf.cpp(";
+    const char *suffix=first?") FindFirst()":") FindNext()";
+    size_t plen=sizeof(prefix)-1u,slen=strlen(suffix),dlen=0;
+    if(bytes<=plen+slen || memcmp(line,prefix,plen))return 0;
+    if(!digits_span(line+plen,bytes-plen-slen,&dlen))return 0;
+    return plen+dlen+slen==bytes && !memcmp(line+plen+dlen,suffix,slen);
+}
+static int unmounted_cmd_kind(const char *line,size_t bytes) {
+    static const char prefix[]="[MMGR][AVI] ## ERROR(MMGR):0x31000007 ## avimmgr/AviMMgrCmd.cpp(";
+    static const char suffix_direct[]=") GetDeviceInfo()";
+    static const char suffix_ms1[]=")[AVIMMGR][MS1]CheckMSId : MS IDs are same.";
+    static const char suffix_ms2[]=")[AVIMMGR][MS2]CheckMSId : MS IDs are same.";
+    size_t plen=sizeof(prefix)-1u,dlen=0;
+    if(bytes<=plen || memcmp(line,prefix,plen))return 0;
+    if(!digits_span(line+plen,bytes-plen,&dlen))return 0;
+    const char *rest=line+plen+dlen;
+    size_t rlen=bytes-plen-dlen;
+    if(line_equals(rest,rlen,suffix_direct))return 1;
+    if(line_equals(rest,rlen,suffix_ms1) || line_equals(rest,rlen,suffix_ms2))return 2;
+    return 0;
 }
 /* 1=entry,0=normal end,-1=untrustworthy/incomplete reply,-2=a complete,
  * explicit unmounted-media outcome. The caller must discard the whole partial
  * inventory and start a new root FFirst; never resume an invalidated cursor. */
+static int benign_async_debug(const char *s,size_t n) {
+    if(unmounted_ms_line(s,n))return 0;
+    int match=(n>=9u && !memcmp(s,"[AVIMMGR]",9u)) || (n>=8u && !memcmp(s,"[MprCnv]",8u));
+    if(!match)return 0;
+    static const char *const bad[]={"ERROR","ER_","FAIL","Fail","Unmounted"};
+    for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);++i) {
+        size_t bl=strlen(bad[i]);
+        for(size_t pos=0;pos+bl<=n;++pos)
+            if(!memcmp(s+pos,bad[i],bl))return 0;
+    }
+    return 1;
+}
 static int native_item(struct transport *t,const char *directory,int first,struct item *item) {
     char cmd[128],response[RESPONSE_BYTES];const char *verb=first?"FFirst":"FNext";
+    t->metadata_retryable=0;
     if(first)snprintf(cmd,sizeof(cmd),"MPR FileIf FFirst %s/*",directory);
     else strcpy(cmd,"MPR FileIf FNext");
     char expected[40];snprintf(expected,sizeof(expected),"MprFileIf : %s %s",verb,
@@ -330,29 +411,64 @@ static int native_item(struct transport *t,const char *directory,int first,struc
     unsigned headers=0,no_more=0,statuses=0,end_status=0,unmounted_status=0;
     unsigned unmounted=0,unmounted_detail=0,unmounted_info_detail=0;
     unsigned first_ok=0,next_ok=0,other=0;
-    unsigned retries=0,wd_version=0;int outcome_started=0,invalid_retry=0,invalid_version=0;
+    unsigned retries=0,wd_version=0,callbacks=0,cache_groups=0,cache_step=0;
+    int outcome_started=0,invalid_retry=0,invalid_version=0,invalid_callback=0,invalid_cache=0;
+    int unmounted_checkmsid_pending=0;
     for(const char *line=body;*line;) {
         const char *next=strchr(line,'\n');size_t bytes=next?(size_t)(next-line):strlen(line);
         const char *value=line;
         while(bytes && (*value==' '||*value=='\t')){++value;--bytes;}
         while(bytes && (value[bytes-1]==' '||value[bytes-1]=='\t'))--bytes;
         if(!bytes){}
-        else if(line_equals(value,bytes,expected))++headers;
+        else if(unmounted_checkmsid_pending) {
+            unmounted_checkmsid_pending=0;
+            if(line_equals(value,bytes,"GetDeviceInfo()"))++unmounted_info_detail;
+            else ++other;
+        }
+        else if(line_equals(value,bytes,expected)){if(cache_step){cache_step=99u;invalid_cache=1;}++headers;}
         else if(bytes>=5u && !memcmp(value,"[MSL]",5u)) {
+            if(cache_step){cache_step=99u;invalid_cache=1;}
             /* Captured on the first cold-media root FFirst. Only this exact
              * version record, once after the header and before any outcome,
              * may precede a complete successful directory entry. */
-            if(!first || strcmp(directory,"ms:/DCIM") || headers!=1u ||
+            if(!first || !valid_mpr_root(directory) || headers!=1u ||
                outcome_started || wd_version++ || !wd_version_line(value,bytes))invalid_version=1;
+        }
+        else if(line_equals(value,bytes,"[CACHE]BUFFER SIZE TOO SMALL : 00000000")) {
+            /* Cold/new photo FFirst/FNext playback cache notice seen on live camera;
+             * require exact ordered 3-line group right after FFirst/FNext header. */
+            if(!valid_mpr_scope(directory) || headers!=1u || outcome_started || callbacks ||
+               cache_groups++ || cache_step!=0u){cache_step=99u;invalid_cache=1;}
+            else cache_step=1u;
+        }
+        else if(line_equals(value,bytes,"[CACHE]ERROR(C1000002h)")) {
+            if(cache_step==1u)cache_step=2u;
+            else{cache_step=99u;invalid_cache=1;}
+        }
+        else if(line_equals(value,bytes,"[MprIf] Callback EnterStillPb")) {
+            if(cache_step==2u)cache_step=3u;
+            else{cache_step=99u;invalid_cache=1;}
+        }
+        else if(bytes>=7u && !memcmp(value,"[MprIf]",7u)) {
+            if(cache_step && cache_step!=3u){cache_step=99u;invalid_cache=1;}
+            /* Captured during live camera playback/capture overlap on FFirst/FNext.
+             * Only this exact status callback once before entry metadata. */
+            if(!valid_mpr_scope(directory) || headers!=1u || outcome_started || cache_groups ||
+               callbacks++ || !line_equals(value,bytes,"[MprIf] Callback GetStillAttrInfo"))
+                invalid_callback=1;
         }
         else if((bytes>=15u && !memcmp(value,"FindFirst Retry",15u)) ||
                 (bytes>=14u && !memcmp(value,"FindNext Retry",14u))) {
+            if(cache_step){cache_step=99u;invalid_cache=1;}
             /* Sony may announce clearing one old FFirst handle before making
              * the new call. It is informational, never a command retry here.
              * Validate it before any success/end/unmounted early return. */
             if(!first || !line_equals(value,bytes,"FindFirst Retry.") ||
                retries++ || outcome_started)invalid_retry=1;
+        } else if(headers==1u && benign_async_debug(value,bytes)) {
+            /* Skip benign asynchronous [AVIMMGR]/[MprCnv] trace lines safely. */
         } else {
+            if(cache_step && cache_step!=3u){cache_step=99u;invalid_cache=1;}
             outcome_started=1;
             if(line_equals(value,bytes,"No more Files."))++no_more;
             else if(bytes>=2u && !memcmp(value,"ec",2)) {
@@ -361,26 +477,42 @@ static int native_item(struct transport *t,const char *directory,int first,struc
                 else if(line_equals(value,bytes,"ec = 0x0000100B"))++unmounted_status;
             } else if(line_equals(value,bytes,"FindFirst OK."))++first_ok;
             else if(line_equals(value,bytes,"FindNext OK."))++next_ok;
-            else if(line_equals(value,bytes,"[AVIMMGR][MS1]GetDeviceInfo : ER_SEQUENCE  DEVICE Unmounted"))++unmounted;
-            else if(line_equals(value,bytes,first?
-                "[MMGR][AVI] ## ERROR(MMGR/FileIf):0x0EF10001 ## avimmgr/AviMMgrFileIf.cpp(588) FindFirst()":
-                "[MMGR][AVI] ## ERROR(MMGR/FileIf):0x0EF10001 ## avimmgr/AviMMgrFileIf.cpp(696) FindNext()"))++unmounted_detail;
-            else if(line_equals(value,bytes,"[MMGR][AVI] ## ERROR(MMGR):0x31000007 ## avimmgr/AviMMgrCmd.cpp(16755) GetDeviceInfo()"))++unmounted_info_detail;
-            else ++other;
+            else if(unmounted_ms_line(value,bytes))++unmounted;
+            else if(unmounted_fileif_line(value,bytes,first))++unmounted_detail;
+            else {
+                int ucmd=unmounted_cmd_kind(value,bytes);
+                if(ucmd==1)++unmounted_info_detail;
+                else if(ucmd==2)unmounted_checkmsid_pending=1;
+                else ++other;
+            }
         }
         if(!next)break;
         line=next+1;
     }
+    if(unmounted_checkmsid_pending)++other;
+#if defined(FILM_CAPTURE_PERSISTENT) && FILM_CAPTURE_PERSISTENT
+    if(invalid_version){t->metadata_retryable=1;return diagnostic(t,"invalid_wd_version",0);}
+    if(invalid_callback){t->metadata_retryable=1;return diagnostic(t,"invalid_callback",0);}
+    if(invalid_cache || (cache_groups && cache_step!=3u)){t->metadata_retryable=1;return diagnostic(t,"invalid_cache_notice",0);}
+    if(invalid_retry){t->metadata_retryable=1;return diagnostic(t,"invalid_retry",0);}
+#else
     if(invalid_version)return diagnostic(t,"invalid_wd_version",0);
+    if(invalid_callback)return diagnostic(t,"invalid_callback",0);
+    if(invalid_cache || (cache_groups && cache_step!=3u))return diagnostic(t,"invalid_cache_notice",0);
     if(invalid_retry)return diagnostic(t,"invalid_retry",0);
+#endif
     if(headers!=1u)return diagnostic(t,"duplicate_header",0);
     if(no_more==1u && statuses==1u && end_status==1u && !unmounted_status &&
        !unmounted && !unmounted_detail && !unmounted_info_detail &&
-       !first_ok && !next_ok && !other && !wd_version)return 0;
+       !first_ok && !next_ok && !other && !wd_version
+#if !(defined(FILM_CAPTURE_PERSISTENT) && FILM_CAPTURE_PERSISTENT)
+       && !callbacks && !cache_groups
+#endif
+       )return 0;
     if(!no_more && statuses==1u &&
        unmounted_status==1u && unmounted==1u && unmounted_detail<=1u &&
        unmounted_info_detail<=1u &&
-       !end_status && !first_ok && !next_ok && !other && !wd_version)return -2;
+       !end_status && !first_ok && !next_ok && !other && !wd_version && !callbacks && !cache_groups)return -2;
     if(no_more || statuses || unmounted || unmounted_detail || unmounted_info_detail ||
        first_ok!=(first?1u:0u) || next_ok!=(first?0u:1u))return diagnostic(t,"native_status",0);
     memset(item,0,sizeof(*item));int kind=0,size=0,stamp=0,header=0;
@@ -389,7 +521,11 @@ static int native_item(struct transport *t,const char *directory,int first,struc
         line=trim(line);if(!*line)continue;
         if(strstr(line,expected)==line){if(header++)return diagnostic(t,"duplicate_header",0);continue;}
         if(wd_version && !strncmp(line,"[MSL]",5u))continue; /* Fully validated above. */
+        if(callbacks && !strcmp(line,"[MprIf] Callback GetStillAttrInfo"))continue;
+        if(cache_groups && (!strcmp(line,"[CACHE]BUFFER SIZE TOO SMALL : 00000000") ||
+           !strcmp(line,"[CACHE]ERROR(C1000002h)") || !strcmp(line,"[MprIf] Callback EnterStillPb")))continue;
         if(!strcmp(line,"FindFirst Retry."))continue; /* Already position/verb/count validated. */
+        if(header && benign_async_debug(line,strlen(line)))continue;
         if(!item->name[0]) {
             if(!component(line))return diagnostic(t,"invalid_name",0);
             strcpy(item->name,line);continue;
@@ -412,42 +548,78 @@ static int native_item(struct transport *t,const char *directory,int first,struc
             if(!n)return diagnostic(t,"invalid_stamp",0);
         }
     }
-    return item->name[0] && kind==1 && size==1 && stamp==1 ? 1 : diagnostic(t,"incomplete_metadata",0);
+    if(item->name[0] && kind==1 && size==1 && stamp==1)return 1;
+    t->metadata_retryable=1;
+    return diagnostic(t,"incomplete_metadata",0);
 }
 static int dcf_directory(const char *s) {
     if(strlen(s)!=8 || s[0]<'1'||s[0]>'9')return 0;
     for(unsigned i=1;i<3;++i)if(s[i]<'0'||s[i]>'9')return 0;
     return 1;
 }
-static int jpeg_name(const char *s) {return strlen(s)==12 && !strcmp(s+8,".JPG");}
-static int inventory(struct transport *t,struct catalogue *out) {
+static int jpeg_name(const char *s) {return s[0]!='.' && strlen(s)==12 && !strcmp(s+8,".JPG");}
+static int scan_one_dir(struct transport *t,const char *directory,struct catalogue *out,int latest_only) {
+    struct item item;int first=1,result;
+    while((result=native_item(t,directory,first,&item))==1) {
+        first=0;
+        if(!item.directory && jpeg_name(item.name)) {
+            char path[sizeof(out->items[0].path)];
+            /* Directory is validated root plus eight validated DCF characters. */
+            snprintf(path,sizeof(path),"%.47s/%.12s",directory,item.name);
+            for(unsigned i=0;i<out->count;++i)if(!strcmp(out->items[i].path,path))return diagnostic(t,"duplicate_path",0);
+            struct entry *e=0;
+            if(out->count<MAX_FILES) {
+                e=&out->items[out->count++];
+            } else if(latest_only) {
+                unsigned min_idx=0;
+                for(unsigned i=1;i<out->count;++i)if(strcmp(out->items[i].path,out->items[min_idx].path)<0)min_idx=i;
+                if(strcmp(path,out->items[min_idx].path)>0)e=&out->items[min_idx];
+                else continue;
+            } else {
+                return diagnostic(t,"file_capacity",0);
+            }
+            strcpy(e->path,path);
+            strcpy(e->time,item.time);e->size=item.size;
+        }
+    }
+    if(result<0){out->count=0;return result;}
+    return 0;
+}
+static int inventory_dirs_with_hint(struct transport *t,struct catalogue *out,int latest_only,const char *hint_dir) {
     char directories[MAX_DIRS][48];unsigned count=0;int first=1,result;
     struct item item;out->count=0;t->scan_started=now_ms();
-    while((result=native_item(t,"ms:/DCIM",first,&item))==1) {
+    if(!valid_mpr_root(CAPTURE_MPR_ROOT))return diagnostic(t,"invalid_mpr_root",0);
+    if(latest_only && hint_dir && hint_dir[0])
+        return scan_one_dir(t,hint_dir,out,1);
+    if(latest_only)directories[0][0]=0;
+    while((result=native_item(t,CAPTURE_MPR_ROOT,first,&item))==1) {
         first=0;
         if(item.directory && dcf_directory(item.name)) {
-            if(count==MAX_DIRS)return diagnostic(t,"directory_capacity",0);
+            char candidate[48];
             /* dcf_directory already requires exactly eight characters. */
-            snprintf(directories[count++],sizeof(directories[0]),"ms:/DCIM/%.8s",item.name);
+            snprintf(candidate,sizeof(candidate),"%s/%.8s",CAPTURE_MPR_ROOT,item.name);
+            if(latest_only) {
+                if(!count || strcmp(candidate,directories[0])>0)
+                    snprintf(directories[0],sizeof(directories[0]),"%s",candidate);
+                count=1u;
+            } else {
+                if(count==MAX_DIRS)return diagnostic(t,"directory_capacity",0);
+                snprintf(directories[count++],sizeof(directories[0]),"%s",candidate);
+            }
         }
     }
     if(result<0){out->count=0;return result;}
     for(unsigned d=0;d<count;++d) {
-        first=1;
-        while((result=native_item(t,directories[d],first,&item))==1) {
-            first=0;
-            if(!item.directory && jpeg_name(item.name)) {
-                if(out->count==MAX_FILES)return diagnostic(t,"file_capacity",0);
-                struct entry *e=&out->items[out->count++];
-                /* Directory is ms:/DCIM/ plus eight validated DCF characters. */
-                snprintf(e->path,sizeof(e->path),"%.17s/%.12s",directories[d],item.name);
-                strcpy(e->time,item.time);e->size=item.size;
-                for(unsigned i=0;i+1<out->count;++i)if(!strcmp(out->items[i].path,e->path))return diagnostic(t,"duplicate_path",0);
-            }
-        }
-        if(result<0){out->count=0;return result;}
+        result=scan_one_dir(t,directories[d],out,latest_only);
+        if(result<0)return result;
     }
     return 0;
+}
+static int inventory_dirs(struct transport *t,struct catalogue *out,int latest_only) {
+    return inventory_dirs_with_hint(t,out,latest_only,NULL);
+}
+static int inventory(struct transport *t,struct catalogue *out) {
+    return inventory_dirs(t,out,0);
 }
 int main(int argc,char **argv) {
     struct transport t={.pid=-1,.in=-1,.out=-1};int result=1,lock=-1;
@@ -467,7 +639,7 @@ int main(int argc,char **argv) {
     printf("CAPTURE_READY mode=%s read_only=1 close_notification_proven=0 revision=4 uptime_ms=%u active_ms=%u\n",
            argv[1],(unsigned)run_started,CAPTURE_ACTIVE_MS);
     if(transport_start(&t)){printf("CAPTURE_FAIL monitor_start\n");goto done;}
-    struct catalogue current;static struct seen seen[MAX_FILES];unsigned seen_count=0;
+    static struct catalogue current;static struct seen seen[MAX_FILES];unsigned seen_count=0;
     int baseline=inventory(&t,&current);
     if(baseline){
         if(baseline==-2)diagnostic(&t,"baseline_media_unavailable",0);
@@ -475,7 +647,7 @@ int main(int argc,char **argv) {
     }
     for(unsigned i=0;i<current.count;++i) {
         seen[i].value=current.items[i];seen[i].reported=1;
-        printf("CAPTURE_EXISTING path=%s size=%u\n",current.items[i].path,current.items[i].size);
+        printf("CAPTURE_EXISTING path=%s size=%llu\n",current.items[i].path,(unsigned long long)current.items[i].size);
     }
     seen_count=current.count;
     printf("CAPTURE_BASELINE count=%u uptime_ms=%u\n",seen_count,(unsigned)now_ms());
@@ -526,8 +698,8 @@ int main(int argc,char **argv) {
             s->present=1;
             if(!s->reported && e->size && (uint32_t)(now-s->stable)>=CAPTURE_STABLE_MS) {
                 s->reported=1;++candidates;
-                printf("CAPTURE_CANDIDATE path=%s size=%u stable_ms=%u heuristic_only=1 uptime_ms=%u elapsed_ms=%u\n",
-                       e->path,e->size,(unsigned)(now-s->stable),(unsigned)now,(unsigned)(now-start));
+                printf("CAPTURE_CANDIDATE path=%s size=%llu stable_ms=%u heuristic_only=1 uptime_ms=%u elapsed_ms=%u\n",
+                       e->path,(unsigned long long)e->size,(unsigned)(now-s->stable),(unsigned)now,(unsigned)(now-start));
             }
         }
         for(unsigned i=0;i<seen_count;++i)if(!seen[i].present)seen[i].stable=0;

@@ -1,25 +1,34 @@
 #include "film_menu.h"
 
-static const char *const stock_keys[5] = {
-    "PORTRA_400", "CINESTILL_800T", "FUJI_PROVIA", "KODAK_GOLD", "TRI_X_400"
+static const char *const stock_keys[12] = {
+    "PORTRA_400", "CINESTILL_800T", "FUJI_PROVIA", "KODAK_GOLD", "TRI_X_400",
+    "CLASSIC_CHROME", "AGFA_ULTRA_100", "POLAROID_669", "FUJI_ACROS",
+    "POLAROID_PX680", "KODAK_EKTAR_100", "ILFORD_HP5"
 };
-static const char *const stock_workers[5] = {
-    "portra_400", "cinestill_800t", "fuji_provia", "kodak_gold", "tri_x_400"
+static const char *const stock_workers[12] = {
+    "portra_400", "cinestill_800t", "fuji_provia", "kodak_gold", "tri_x_400",
+    "classic_chrome", "agfa_ultra_100", "polaroid_669", "fuji_acros",
+    "polaroid_px680", "kodak_ektar_100", "ilford_hp5"
 };
-static const char *const stock_labels[5] = {
-    "Portra 400", "CineStill 800T", "Fuji Provia", "Kodak Gold", "Tri-X 400"
+static const char *const stock_labels[12] = {
+    "Portra 400", "CineStill 800T", "Fuji Provia", "Kodak Gold", "Tri-X 400",
+    "Classic Chrome", "Agfa Ultra 100", "Polaroid 669", "Fuji Acros",
+    "Polaroid PX-680", "Kodak Ektar 100", "Ilford HP5"
 };
 static const char *const grain_keys[4] = {"OFF", "LOW", "MEDIUM", "HIGH"};
 
 static int valid(const struct film_settings *s) {
-    return s && s->enabled >= 0 && s->enabled <= 1 && s->stock >= 0 && s->stock < 5 &&
+    return s && s->enabled >= 0 && s->enabled <= 1 && s->stock >= 0 && s->stock < 12 &&
            s->grain >= 0 && s->grain < 4 && s->halation >= 0 && s->halation <= 1;
 }
 const char *film_stock_worker_name(int stock) {
-    return stock >= 0 && stock < 5 ? stock_workers[stock] : (const char *)0;
+    return stock >= 0 && stock < 12 ? stock_workers[stock] : (const char *)0;
 }
 const char *film_stock_display_name(int stock) {
-    return stock >= 0 && stock < 5 ? stock_labels[stock] : (const char *)0;
+    return stock >= 0 && stock < 12 ? stock_labels[stock] : (const char *)0;
+}
+const char *film_grain_display_name(int grain) {
+    return grain >= 0 && grain < 4 ? grain_keys[grain] : (const char *)0;
 }
 void film_menu_init(struct film_menu *m, const struct film_settings *settings) {
     *m = (struct film_menu){0};
@@ -70,16 +79,35 @@ unsigned film_menu_input(struct film_menu *m, unsigned now, int menu, int zoom, 
     return FILM_MENU_OPENED | FILM_MENU_REDRAW;
 }
 int film_menu_hit(int page, int x, int y) {
-    if (x < 28 || x >= 612) return -1;
-    int first = page == FILM_MENU_HOME ? 116 : 88;
-    int step = page == FILM_MENU_HOME ? 80 : 56;
-    int height = page == FILM_MENU_HOME ? 60 : 48;
-    int count = page == FILM_MENU_HOME ? 3 : 6;
-    if (y < first || y >= first + count * step) return -1;
-    return (y - first) % step < height ? (y - first) / step : -1;
+    if (page == FILM_MENU_HOME) {
+        if (x >= 76 && x < 564) {
+            if (y >= 98 && y < 158) return 0;
+            if (y >= 168 && y < 228) return 1;
+            if (y >= 238 && y < 298) return 4;
+        }
+        if (x >= 76 && x < 340 && y >= 386 && y < 428) return 7;
+        if (x >= 404 && x < 564 && y >= 386 && y < 428) return 2;
+        return -1;
+    }
+    if (page == FILM_MENU_DETAILS) {
+        if (x >= 76 && x < 564) {
+            if (y >= 106 && y < 182) return 0;
+            if (y >= 198 && y < 274) return 1;
+            if (y >= 290 && y < 366) return 2;
+        }
+        if (x >= 404 && x < 564 && y >= 386 && y < 428) return 5;
+        return -1;
+    }
+    int pcount = page == FILM_MENU_STOCKS_3 ? 2 : 5;
+    if (x >= 76 && x < 564 && y >= 98 && y < 98 + pcount * 54) {
+        return (y - 98) % 54 < 46 ? (y - 98) / 54 : -1;
+    }
+    if (x >= 404 && x < 564 && y >= 386 && y < 428) return 5;
+    if (x >= 76 && x < 236 && y >= 386 && y < 428) return 6;
+    return -1;
 }
 int film_menu_set_stock(struct film_menu *m, int stock) {
-    if (stock < 0 || stock >= 5) return -1;
+    if (stock < 0 || stock >= 12) return -1;
     if (m->settings.stock == stock) return 0;
     m->settings.stock = stock;
     return FILM_MENU_SETTINGS_CHANGED;
@@ -90,11 +118,44 @@ static unsigned activate(struct film_menu *m, int row) {
         if (row == 0) {
             m->settings.enabled ^= 1;
             change |= FILM_MENU_SETTINGS_CHANGED;
-        } else if (row == 1) m->page = FILM_MENU_STOCKS;
-        else if (row == 2) return film_menu_close(m);
+        } else if (row == 1) {
+            m->page = m->settings.stock >= 10 ? FILM_MENU_STOCKS_3
+                    : (m->settings.stock >= 5 ? FILM_MENU_STOCKS_2 : FILM_MENU_STOCKS);
+        } else if (row == 4) {
+            m->page = FILM_MENU_DETAILS;
+        } else if (row == 2) {
+            return film_menu_close(m);
+        } else if (row == 7) {
+            change |= FILM_MENU_HIRES_TOGGLED;
+        }
+    } else if (m->page == FILM_MENU_DETAILS) {
+        if (row == 0) {
+            m->settings.grain = (m->settings.grain + 1) & 3;
+            change |= FILM_MENU_SETTINGS_CHANGED;
+        } else if (row == 1) {
+            m->settings.halation ^= 1;
+            change |= FILM_MENU_SETTINGS_CHANGED;
+        } else if (row == 2) {
+            if (m->settings.grain != 2 || m->settings.halation != 1) {
+                m->settings.grain = 2;
+                m->settings.halation = 1;
+                change |= FILM_MENU_SETTINGS_CHANGED;
+            }
+        } else if (row == 5) {
+            m->page = FILM_MENU_HOME;
+        }
     } else {
-        if (row < 5) change |= (unsigned)film_menu_set_stock(m, row);
-        m->page = FILM_MENU_HOME;
+        int base = m->page == FILM_MENU_STOCKS ? 0 : (m->page == FILM_MENU_STOCKS_2 ? 5 : 10);
+        int pcount = m->page == FILM_MENU_STOCKS_3 ? 2 : 5;
+        if (row >= 0 && row < pcount) {
+            change |= (unsigned)film_menu_set_stock(m, base + row);
+            m->page = FILM_MENU_HOME;
+        } else if (row == 5) {
+            m->page = FILM_MENU_HOME;
+        } else if (row == 6) {
+            m->page = m->page == FILM_MENU_STOCKS ? FILM_MENU_STOCKS_2
+                    : (m->page == FILM_MENU_STOCKS_2 ? FILM_MENU_STOCKS_3 : FILM_MENU_STOCKS);
+        }
     }
     return change;
 }
@@ -150,7 +211,7 @@ int film_settings_parse(struct film_settings *result, const char *text, unsigned
         if (equal(text + first, split - first, "ENABLED")) {
             bit = 1; s.enabled = equal(value, n, "0") ? 0 : equal(value, n, "1") ? 1 : -1;
         } else if (equal(text + first, split - first, "STOCK")) {
-            bit = 2; s.stock = choice(value, n, stock_keys, 5);
+            bit = 2; s.stock = choice(value, n, stock_keys, 12);
         } else if (equal(text + first, split - first, "GRAIN")) {
             bit = 4; s.grain = choice(value, n, grain_keys, 4);
         } else if (equal(text + first, split - first, "HALATION")) {

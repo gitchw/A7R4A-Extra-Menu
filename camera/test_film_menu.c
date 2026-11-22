@@ -14,9 +14,19 @@ static void chord(struct film_menu *m) {
     for (int i = 0; i < 7; ++i) sample(m, 1, 1, 0);
 }
 static unsigned tap(struct film_menu *m, int row) {
-    int y = m->page == FILM_MENU_HOME ? 116 + row * 80 + 20 : 88 + row * 56 + 15;
+    int is_dismiss = (m->page == FILM_MENU_HOME && row == 2) ||
+                     (m->page != FILM_MENU_HOME && row == 5);
+    int is_page = (m->page != FILM_MENU_HOME && m->page != FILM_MENU_DETAILS && row == 6);
+    int is_hires = (m->page == FILM_MENU_HOME && row == 7);
+    int x = is_dismiss ? 480 : 120;
+    int y = (is_dismiss || is_page || is_hires) ? 405
+          : (m->page == FILM_MENU_HOME
+             ? (row == 0 ? 128 : (row == 1 ? 198 : 268))
+             : (m->page == FILM_MENU_DETAILS
+                ? (row == 0 ? 140 : (row == 1 ? 230 : 320))
+                : 98 + row * 54 + 20));
     film_menu_touch(m, now += 20, 0, 32767, 32767);
-    film_menu_touch(m, now += 20, 1, 100, y);
+    film_menu_touch(m, now += 20, 1, x, y);
     return film_menu_touch(m, now += 20, 0, 32767, 32767);
 }
 int main(void) {
@@ -54,8 +64,20 @@ int main(void) {
     assert(m.page == FILM_MENU_STOCKS);
     assert(tap(&m, 3) & FILM_MENU_SETTINGS_CHANGED);
     assert(m.settings.stock == 3 && m.page == FILM_MENU_HOME);
+    assert(tap(&m, 7) & FILM_MENU_HIRES_TOGGLED);
+    assert(tap(&m, 4) & FILM_MENU_REDRAW);
+    assert(m.page == FILM_MENU_DETAILS);
+    assert(tap(&m, 0) & FILM_MENU_SETTINGS_CHANGED);
+    assert(m.settings.grain == 3);
+    assert(tap(&m, 0) & FILM_MENU_SETTINGS_CHANGED);
+    assert(m.settings.grain == 0);
+    assert(tap(&m, 1) & FILM_MENU_SETTINGS_CHANGED);
+    assert(m.settings.halation == 0);
+    assert(tap(&m, 5) & FILM_MENU_REDRAW);
+    assert(m.page == FILM_MENU_HOME);
     assert(tap(&m, 2) & FILM_MENU_CLOSED);
-    assert(!m.visible && m.settings.enabled && m.settings.stock == 3);
+    assert(!m.visible && m.settings.enabled && m.settings.stock == 3 &&
+           m.settings.grain == 0 && m.settings.halation == 0);
     for (int i = 0; i < 3; ++i) {
         chord(&m); assert(m.visible);
         assert(sample(&m, 0, 0, 1) & FILM_MENU_CLOSED);
@@ -75,16 +97,19 @@ int main(void) {
     film_menu_touch(&m, now += 20, 1, 100, 300);
     film_menu_touch(&m, now += 20, 0, 32767, 32767);
     assert(m.settings.enabled);
-    for (int stock = 0; stock < 5; ++stock) {
-        tap(&m, 1); assert(m.page == FILM_MENU_STOCKS);
-        tap(&m, stock); assert(m.settings.stock == stock);
+    for (int stock = 0; stock < 12; ++stock) {
+        int want = stock < 5 ? FILM_MENU_STOCKS
+            : (stock < 10 ? FILM_MENU_STOCKS_2 : FILM_MENU_STOCKS_3);
+        tap(&m, 1);
+        while (m.page != want) tap(&m, 6);
+        tap(&m, stock % 5); assert(m.page == FILM_MENU_HOME && m.settings.stock == stock);
     }
-    assert(strcmp(film_stock_worker_name(m.settings.stock), "tri_x_400") == 0);
-    assert(film_stock_worker_name(-1) == NULL && film_stock_worker_name(5) == NULL);
+    assert(strcmp(film_stock_worker_name(m.settings.stock), "ilford_hp5") == 0);
+    assert(film_stock_worker_name(-1) == NULL && film_stock_worker_name(12) == NULL);
     chord(&m); assert(!m.visible); chord(&m); assert(m.visible);
     /* All real persisted choices round-trip, independent of menu visibility. */
     for (int enabled = 0; enabled < 2; ++enabled)
-        for (int stock = 0; stock < 5; ++stock)
+        for (int stock = 0; stock < 12; ++stock)
             for (int grain = 0; grain < 4; ++grain)
                 for (int halo = 0; halo < 2; ++halo) {
                     struct film_settings a = {enabled, stock, grain, halo}, b = {0};
@@ -106,8 +131,8 @@ int main(void) {
         assert(memcmp(&a, &before, sizeof a) == 0);
     }
     before = m.settings;
-    assert(film_menu_set_stock(&m, 5) < 0);
+    assert(film_menu_set_stock(&m, 12) < 0);
     assert(memcmp(&m.settings, &before, sizeof before) == 0);
-    puts("FILM_MENU_TESTS_OK persistence=80 presets=5 chord=repeatable hidden_input=untouched");
+    puts("FILM_MENU_TESTS_OK persistence=192 presets=12 chord=repeatable hidden_input=untouched");
     return 0;
 }

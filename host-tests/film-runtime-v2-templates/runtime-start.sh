@@ -6,11 +6,12 @@ export PATH=/usr/bin:/bin:/sbin:/usr/sbin
 BB=/bin/busybox
 RAM=/tmp_bt
 MOUNTS=/proc/mounts
-COMM=/proc/149/comm
-MAPS=/proc/149/maps
+PROC_ROOT=/proc
+COMM=
+MAPS=
 LOCK=$RAM/a6400-film-runtime.lock
-REQUEST=$RAM/a6400-ui-load.req
-GUARD=$RAM/a6400-ui-load-guard.elf
+REQUEST=$RAM/a7r4a-ui-load.req
+GUARD=$RAM/a7r4a-ui-load-guard.elf
 SETTINGS=$RAM/a6400-film-menu-job.elf
 DAEMON=$RAM/a6400-film-capture-daemon.elf
 RUNTIME_LOG=$RAM/a6400-film-capture.runtime.log
@@ -24,7 +25,7 @@ disabled() {
 no_sd_mount() {
     test -r "$MOUNTS" || return 1
     while read -r source target type options rest; do
-        case "$source" in /dev/mmca*|/dev/mmcblk*) return 1;; esac
+        case "$source" in /dev/mmc*) return 1;; esac
     done < "$MOUNTS"
     return 0
 }
@@ -35,7 +36,22 @@ hash_is() {
 }
 gate() { ! disabled && no_sd_mount; }
 ready() {
-    test -r "$COMM" && test -r "$MAPS" || return 1
+    COMM=
+    MAPS=
+    im_count=0
+    set +f
+    set -- "$PROC_ROOT"/[0-9]*/comm
+    set -f
+    for comm_path do
+        test -r "$comm_path" || continue
+        IFS= read -r comm < "$comm_path" 2>/dev/null || continue
+        if test "$comm" = im.elf; then
+            im_count=$((im_count+1))
+            COMM=$comm_path
+            MAPS=${comm_path%/comm}/maps
+        fi
+    done
+    test "$im_count" = 1 && test -r "$COMM" && test -r "$MAPS" || return 1
     IFS= read -r comm < "$COMM" || return 1
     test "$comm" = im.elf &&
         "$BB" grep -q '/usr/bin/im\.elf$' "$MAPS" &&
@@ -65,13 +81,13 @@ guard_step() {
     guard_hash=$3
     guard_log=$RAM/a6400-film-runtime.$guard_name.log
     gate && ready || fail "guard_gate-$guard_name"
-    hash_is "$GUARD" @@GUARD_SHA@@ && hash_is "$RAM/a6400-$guard_name-persist.req" "$guard_hash" || fail guard_pin
+    hash_is "$GUARD" @@GUARD_SHA@@ && hash_is "$RAM/a7r4a-$guard_name.req" "$guard_hash" || fail guard_pin
     if test "$request_ours" = 1; then
         hash_is "$REQUEST" "$last_request_hash" || fail request_drift
     else
         test ! -e "$REQUEST" && test ! -L "$REQUEST" || fail existing_request
     fi
-    "$BB" cp "$RAM/a6400-$guard_name-persist.req" "$REQUEST" || fail request_copy
+    "$BB" cp "$RAM/a7r4a-$guard_name.req" "$REQUEST" || fail request_copy
     hash_is "$REQUEST" "$guard_hash" || fail request_copy_hash
     request_ours=1
     last_request_hash=$guard_hash
@@ -82,6 +98,7 @@ guard_step() {
 }
 if disabled; then echo FILM_RUNTIME_DISABLED;exit 0;fi
 no_sd_mount || fail linux_sd_mounted
+test -d "$RAM" && test ! -L "$RAM" && test -w "$RAM" || fail ram_unwritable
 test -f "$RAM/a6400-film-staged" && test ! -L "$RAM/a6400-film-staged" || fail missing_stage
 while read -r name dest expected mode; do
     hash_is "$RAM/$dest" "$expected" || fail "artifact_hash-$dest"

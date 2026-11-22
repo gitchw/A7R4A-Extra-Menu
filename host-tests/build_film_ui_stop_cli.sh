@@ -22,7 +22,7 @@ assert rva<=0xffffffff-1120 and control<=0xffffffff-4 and control%4==0
 assert not rva<=control<rva+1120,'stop word overlaps UI state'
 h=2166136261
 for b in data:h=((h^b)*16777619)&0xffffffff
-paths={'FILM_UI_STOP_PROC':'/proc/149','FILM_UI_STOP_MODULE':module,
+paths={'FILM_UI_STOP_PROC':'/proc/auto','FILM_UI_STOP_MODULE':module,
  'FILM_UI_STOP_MARKER':'/tmp_bt/a6400-film-capture.stop',
  'FILM_UI_STOP_CAPTURE_LOCK':'/tmp_bt/a6400-capture-v1.lock',
  'FILM_UI_STOP_INFLIGHT':'/tmp_bt/a6400-film-capture.inflight',
@@ -50,12 +50,12 @@ CC=arm-linux-gnueabihf-gcc
 COMMON="-march=armv7-a+fp -mfpu=vfpv3-d16 -mfloat-abi=hard -marm -Os -Wall -Wextra -Werror -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
 OBJECTS=
 for source in film_ui_stop_cli film_settings_source film_settings_snapshot film_settings_maps; do
- $CC $COMMON -std=c11 -DFILM_SETTINGS_PERSISTENT=1 -fPIE -I"$OUT" -c "$ROOT/camera/$source.c" -o "$OUT/$source.o"
+ $CC $COMMON -std=c11 -DFILM_SETTINGS_PERSISTENT=1 -DA7R4A_DYNAMIC_IDENTITY=1 -fPIE -I"$OUT" -I"$ROOT/camera" -c "$ROOT/camera/$source.c" -o "$OUT/$source.o"
  OBJECTS="$OBJECTS $OUT/$source.o"
 done
 $CC $COMMON -c "$ROOT/camera/film_settings_start.S" -o "$OUT/start.o"
 $CC -mfloat-abi=hard -nostdlib -pie \
- -Wl,-e,_start,-z,now,--dynamic-linker=/lib/ld-linux.so.3 \
+ -Wl,-e,_start,-z,now,--dynamic-linker=/lib/ld-linux.so.3,-rpath-link,"$LIBS" \
  "$OUT/start.o" $OBJECTS -Wl,--no-as-needed "$LIBS/libc-2.11.2.so" -lgcc \
  -o "$OUT/a6400-film-ui-stop.elf"
 arm-linux-gnueabihf-readelf -lWdVs "$OUT/a6400-film-ui-stop.elf" > "$OUT/elf-compatibility.txt"

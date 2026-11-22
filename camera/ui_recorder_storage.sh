@@ -16,6 +16,19 @@ recorder_snapshot() {
         return 1
     fi
 }
+_rec_file_bytes() {
+    _rec_path=$1
+    if [ -n "${RECORDER_SIZE_BIN:-}" ] && [ -x "$RECORDER_SIZE_BIN" ]; then
+        _rec_out=$("$RECORDER_SIZE_BIN" --size "$_rec_path" 2>/dev/null) || _rec_out=
+        case "$_rec_out" in ''|*[!0-9]*) ;; *) _rec_size=$_rec_out; return 0 ;; esac
+    fi
+    # BusyBox v1.34.1 on ILCE-7RM4A omits wc; ls -ln column 5 is exact bytes.
+    _rec_ls=$("$BB" ls -ln "$_rec_path" 2>/dev/null) || return 1
+    set -- $_rec_ls
+    [ "$#" -ge 5 ] || return 1
+    case "$5" in ''|*[!0-9]*) return 1 ;; esac
+    _rec_size=$5
+}
 recorder_log() {
     _rec_message=$*
     _rec_limit=${RECORDER_LOG_LIMIT:-8192}
@@ -25,7 +38,7 @@ recorder_log() {
     [ "$_rec_length" -le "$_rec_limit" ] || return 2
     _rec_size=0
     if [ -f "$OUT/index.log" ]; then
-        _rec_size=$("$BB" wc -c < "$OUT/index.log") || return 1
+        _rec_file_bytes "$OUT/index.log" || return 1
     fi
     if [ "$((_rec_size+_rec_length))" -gt "$_rec_limit" ]; then
         "$BB" mv "$OUT/index.log" "$OUT/index.previous.log" || return 1

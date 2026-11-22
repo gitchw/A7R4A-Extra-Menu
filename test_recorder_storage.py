@@ -39,4 +39,13 @@ class RecorderStorageTests(unittest.TestCase):
         self.assertFalse((self.out/'journal.new').exists())
         r=self.run_script(f'recorder_snapshot ../unsafe 0 "{prior}"',False)
         self.assertNotEqual(r.returncode,0)
+
+    def test_rotates_via_ls_fallback_when_busybox_omits_wc(self):
+        self.bb.write_text('#!/bin/sh\nif [ "$1" = wc ]; then exit 127; fi\ncmd=$1; shift; exec "$cmd" "$@"\n')
+        self.run_script('i=0; while [ "$i" -lt 40 ]; do\n'
+            ' recorder_log "EVENT $i ......................................................" || exit 8\n'
+            ' i=$((i+1)); done')
+        files=list(self.out.iterdir());self.assertEqual(len(files),2)
+        self.assertTrue(all(p.stat().st_size<=512 for p in files))
+        self.assertIn('EVENT 39 ',(self.out/'index.log').read_text())
 if __name__=='__main__':unittest.main(verbosity=2)

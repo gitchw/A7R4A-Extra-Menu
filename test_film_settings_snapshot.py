@@ -54,14 +54,14 @@ class FilmSettingsSnapshotTests(unittest.TestCase):
 
     def test_all_preset_choices_and_on_off(self):
         for enabled in (0,1):
-            for stock in range(5):
+            for stock in range(12):
                 data=bytearray(self.original);struct.pack_into('<4I',data,0,enabled,stock,2,1)
                 self.assertEqual(self.call(data),(0,(enabled,stock,2,1)))
 
     def test_changing_settings_or_wrong_identity_never_publish(self):
         changed=bytearray(self.original);struct.pack_into('<I',changed,4,4)
         self.assertEqual(self.call(self.original,changed),(2,(9,9,9,9)))
-        for offset,bad in [(0,2),(4,5),(8,4),(12,2),(0x68,0),(0xc0,381),(0x18c,0)]:
+        for offset,bad in [(0,2),(4,12),(8,4),(12,2),(0x68,0),(0xc0,381),(0x18c,0)]:
             data=bytearray(self.original);struct.pack_into('<I',data,offset,bad)
             self.assertEqual(self.call(data),(-1,(9,9,9,9)),offset)
         self.assertEqual(self.call(self.original[:100],now=1),(-1,(9,9,9,9)))
